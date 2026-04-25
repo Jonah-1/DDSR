@@ -68,6 +68,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        num_mask_layers=6,
     ):
         super().__init__()
 
@@ -115,6 +116,7 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.num_mask_layers = num_mask_layers
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -181,11 +183,14 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, dynamic_mask: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            dynamic_mask (torch.Tensor, optional): Binary mask [B, S, H, W] where 1 indicates
+                dynamic regions. For the first num_mask_layers layers, dynamic token K vectors
+                are zeroed so static tokens cannot attend to them.
 
         Returns:
             (list[torch.Tensor], int):
@@ -230,6 +235,11 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        # Compute patch-level key mask for dynamic regions (used in first num_mask_layers layers)
+        patch_key_mask = None
+        if dynamic_mask is not None:
+            patch_key_mask = self._compute_patch_key_mask(dynamic_mask, B, S, H, W, images.device)
+
         frame_idx = 0
         global_idx = 0
         output_list = []
@@ -238,11 +248,11 @@ class Aggregator(nn.Module):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, patch_key_mask=patch_key_mask
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, patch_key_mask=patch_key_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -257,7 +267,27 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _compute_patch_key_mask(
+        self, dynamic_mask: torch.Tensor, B: int, S: int, H: int, W: int, device: torch.device
+    ) -> torch.Tensor:
+        """
+        Downsample pixel-level dynamic_mask to patch-level and prepend False for special tokens.
+
+        Args:
+            dynamic_mask: [B, S, H, W] binary float/bool, 1 = dynamic pixel
+        Returns:
+            patch_key_mask: [B*S, patch_start_idx + Ph*Pw] bool, True = dynamic token
+        """
+        mask_flat = dynamic_mask.float().view(B * S, 1, H, W)
+        # Max pool: any dynamic pixel in a patch makes the whole patch dynamic
+        mask_patch = F.max_pool2d(mask_flat, kernel_size=self.patch_size, stride=self.patch_size)
+        Ph, Pw = H // self.patch_size, W // self.patch_size
+        mask_patch = mask_patch.squeeze(1).view(B * S, Ph * Pw).bool()
+        # Camera and register tokens are never masked
+        special_false = torch.zeros(B * S, self.patch_start_idx, dtype=torch.bool, device=device)
+        return torch.cat([special_false, mask_patch], dim=1)  # [B*S, P]
+
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, patch_key_mask=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -272,16 +302,17 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            key_mask = patch_key_mask if (frame_idx < self.num_mask_layers and patch_key_mask is not None) else None
             if self.training:
-                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, key_mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                tokens = self.frame_blocks[frame_idx](tokens, pos=pos, key_mask=key_mask)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, patch_key_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -291,14 +322,18 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
+        # Reshape patch_key_mask from [B*S, P] to [B, S*P] for global attention
+        global_key_mask = patch_key_mask.view(B, S * P) if patch_key_mask is not None else None
+
         intermediates = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            key_mask = global_key_mask if (global_idx < self.num_mask_layers and global_key_mask is not None) else None
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, key_mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, key_mask=key_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

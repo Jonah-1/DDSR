@@ -9,7 +9,7 @@
 
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict
+from typing import Callable, List, Any, Tuple, Dict, Optional
 import warnings
 
 import torch
@@ -74,9 +74,9 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, key_mask: Optional[Tensor] = None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+            return self.ls1(self.attn(self.norm1(x), pos=pos, key_mask=key_mask))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))

@@ -40,11 +40,12 @@
 
 ## 前 6 层双路径详解
 
-### 路径 1：静态路径（K=0 遮蔽）
+### 路径 1：静态路径（K=0 遮蔽）**已实现**
 
 - 动态掩码对应位置的 token，在做交叉注意力时将其 **K 向量置 0**
 - 效果：静态区域的 token 在 attention 时无法"看到"动态区域，静态特征提取不受动态物体干扰
 - 权重**冻结**，不参与梯度更新
+- 实现：`Aggregator.forward(dynamic_mask)` → `_compute_patch_key_mask()` 将像素掩码降采样至 patch 级；前 `num_mask_layers`（默认 6）层的 frame/global block 均传入此 mask；`Attention.forward()` 对动态 token 的 K 调用 `masked_fill(..., 0.0)` 置零
 
 ### 路径 2：动态路径（Deformable Attention）
 

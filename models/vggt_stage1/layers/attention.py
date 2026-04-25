@@ -10,6 +10,7 @@
 import logging
 import os
 import warnings
+from typing import Optional
 
 from torch import Tensor
 from torch import nn
@@ -47,11 +48,16 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, key_mask: Optional[Tensor] = None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
+
+        if key_mask is not None:
+            # key_mask: [B, N] bool, True = dynamic token whose K should be zeroed
+            # k: [B, num_heads, N, head_dim] -> mask along token dim
+            k = k.masked_fill(key_mask.unsqueeze(1).unsqueeze(-1), 0.0)
 
         if self.rope is not None:
             q = self.rope(q, pos)
