@@ -12,6 +12,7 @@ import os
 import warnings
 from typing import Optional
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -32,6 +33,8 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        lora_r: int = 0,
+        lora_alpha: float = 1.0,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -48,9 +51,24 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
+        self.lora_r = lora_r
+        if lora_r > 0:
+            self.lora_scale = lora_alpha / lora_r
+            self.lora_qkv_A = nn.Linear(dim, lora_r, bias=False)
+            self.lora_qkv_B = nn.Linear(lora_r, dim * 3, bias=False)
+            self.lora_proj_A = nn.Linear(dim, lora_r, bias=False)
+            self.lora_proj_B = nn.Linear(lora_r, dim, bias=False)
+            nn.init.kaiming_uniform_(self.lora_qkv_A.weight, a=5 ** 0.5)
+            nn.init.zeros_(self.lora_qkv_B.weight)
+            nn.init.kaiming_uniform_(self.lora_proj_A.weight, a=5 ** 0.5)
+            nn.init.zeros_(self.lora_proj_B.weight)
+
     def forward(self, x: Tensor, pos=None, key_mask: Optional[Tensor] = None) -> Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv_w = self.qkv(x)
+        if self.lora_r > 0:
+            qkv_w = qkv_w + self.lora_scale * self.lora_qkv_B(self.lora_qkv_A(x))
+        qkv = qkv_w.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -73,8 +91,10 @@ class Attention(nn.Module):
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        x_proj = self.proj(x)
+        if self.lora_r > 0:
+            x_proj = x_proj + self.lora_scale * self.lora_proj_B(self.lora_proj_A(x))
+        x = self.proj_drop(x_proj)
         return x
 
 

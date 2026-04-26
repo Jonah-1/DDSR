@@ -16,9 +16,11 @@
      ┌────┴─────────────────────┐
      │      前 6 层（双路径）     │
      │                          │
-     │  路径1（静态路径）         │  路径2（动态路径）
+     │  路径1（静态路径）         │  路径2（静态信息提取路径）
      │  冻结权重                 │  LoRA 微调
-     │  动态区域 K = 0           │  动态区域用 Deformable Attention
+     │  动态区域 K = 0           │  标准 attention（无 K 置零）
+     │                          │  ↓ 第6层输出后
+     │                          │  动态 token → Deformable Attention
      │                          │
      └────────┬─────────────────┘
               │ 动态区域 token → MLP 融合
@@ -40,19 +42,21 @@
 
 ## 前 6 层双路径详解
 
-### 路径 1：静态路径（K=0 遮蔽）**已实现**
+### 路径 1：绝对静态路径（K=0 遮蔽）**已实现**
 
 - 动态掩码对应位置的 token，在做交叉注意力时将其 **K 向量置 0**
 - 效果：静态区域的 token 在 attention 时无法"看到"动态区域，静态特征提取不受动态物体干扰
 - 权重**冻结**，不参与梯度更新
 - 实现：`Aggregator.forward(dynamic_mask)` → `_compute_patch_key_mask()` 将像素掩码降采样至 patch 级；前 `num_mask_layers`（默认 6）层的 frame/global block 均传入此 mask；`Attention.forward()` 对动态 token 的 K 调用 `masked_fill(..., 0.0)` 置零
 
-### 路径 2：动态路径（Deformable Attention）
+### 路径 2：动态 token 中的静态信息提取路径（标准 Attention + LoRA → DA）
 
-- 不做 K 置零
-- 动态掩码区域的 token 在交叉注意力时改用 **Deformable Attention（DA）**，适配动态物体的形变和位移
-- 静态区域 token 仍走标准 attention
-- 通过 **LoRA** 进行轻量微调，该路径参数可训练
+动态掩码区域的 token 往往杂糅了静态背景信息，路径 2 的目标是**从这些动态 token 中把静态信息抠出来**，与路径 1 提取的绝对静态特征融合，共同构成完整的静态场景表示。
+
+- 不做 K 置零，允许动态 token 与全局上下文交互
+- 前 6 层走**标准 attention**，通过 **LoRA** 轻量微调，参数可训练
+- 第 6 层输出后，对**动态掩码区域的 token** 单独做一次 **Deformable Attention（DA）**，捕捉动态物体形变与位移，从中提炼静态信息
+- 处理后与路径 1 的动态区域 token 进行 MLP 融合
 
 ### 融合
 

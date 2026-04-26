@@ -16,6 +16,7 @@ import torch
 from torch import nn, Tensor
 
 from .attention import Attention
+from .deformable_attention import DeformableTokenAttention
 from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
@@ -44,6 +45,8 @@ class Block(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        lora_r: int = 0,
+        lora_alpha: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -59,6 +62,8 @@ class Block(nn.Module):
             qk_norm=qk_norm,
             fused_attn=fused_attn,
             rope=rope,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
         )
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -143,6 +148,78 @@ def add_residual(x, brange, residual, residual_scale_factor, scaling_vector=None
             x, brange, residual.to(dtype=x.dtype), scaling=scaling_vector, alpha=residual_scale_factor
         )
     return x_plus_residual
+
+
+class DeformableBlock(nn.Module):
+    """
+    Path-2 block: standard attention for static tokens (no K zeroing) and
+    deformable attention to replace dynamic token outputs.
+
+    Args:
+        dim: token embedding dimension
+        num_heads: number of attention heads
+        num_points: sampling points per head for DeformableTokenAttention
+        (remaining args mirror Block)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        num_points: int = 4,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        init_values=None,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        qk_norm: bool = True,
+        rope=None,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.std_attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            proj_bias=proj_bias, qk_norm=qk_norm, rope=rope,
+        )
+        self.deform_attn = DeformableTokenAttention(
+            dim, num_heads=num_heads, num_points=num_points,
+            qkv_bias=qkv_bias, proj_bias=proj_bias,
+        )
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        mlp_hidden = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden,
+                       act_layer=act_layer, bias=ffn_bias)
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+
+    def forward(
+        self,
+        x: Tensor,
+        pos=None,
+        dynamic_mask=None,      # [BS, P] bool; if None, behaves like standard attention
+        patch_start_idx: int = 0,
+        H_p: int = 1,
+        W_p: int = 1,
+    ) -> Tensor:
+        x_norm = self.norm1(x)
+
+        # Standard self-attention across all tokens (no K zeroing)
+        x_std = self.std_attn(x_norm, pos=pos)
+
+        if dynamic_mask is not None and dynamic_mask.any():
+            # Deformable attention only writes to dynamic positions
+            x_da = self.deform_attn(x_norm, dynamic_mask, patch_start_idx, H_p, W_p)
+            x_merged = x_std.clone()
+            x_merged[dynamic_mask] = x_da[dynamic_mask]
+        else:
+            x_merged = x_std
+
+        x = x + self.ls1(x_merged)
+        x = x + self.ls2(self.mlp(self.norm2(x)))
+        return x
 
 
 attn_bias_cache: Dict[Tuple, Any] = {}

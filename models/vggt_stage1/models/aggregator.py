@@ -11,10 +11,11 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple, Union, List, Dict, Any
 
-from vggt.layers import PatchEmbed
-from vggt.layers.block import Block
-from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
-from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from vggt_stage1.layers import PatchEmbed
+from vggt_stage1.layers.block import Block
+from vggt_stage1.layers.deformable_attention import DeformableTokenAttention
+from vggt_stage1.layers.rope import RotaryPositionEmbedding2D, PositionGetter
+from vggt_stage1.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,10 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         num_mask_layers=6,
+        lora_r=8,
+        lora_alpha=16.0,
+        main_lora_r=0,
+        main_lora_alpha=1.0,
     ):
         super().__init__()
 
@@ -90,6 +95,8 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    lora_r=main_lora_r,
+                    lora_alpha=main_lora_alpha,
                 )
                 for _ in range(depth)
             ]
@@ -107,6 +114,8 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    lora_r=main_lora_r,
+                    lora_alpha=main_lora_alpha,
                 )
                 for _ in range(depth)
             ]
@@ -117,6 +126,7 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
         self.num_mask_layers = num_mask_layers
+        self.lora_r = lora_r
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -141,6 +151,55 @@ class Aggregator(nn.Module):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
         self.use_reentrant = False # hardcoded to False
+
+        # ---------- Path 2: standard blocks with LoRA (first num_mask_layers layers) + one DA pass after ----------
+        self.path2_frame_blocks = nn.ModuleList(
+            [
+                block_fn(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    init_values=init_values,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                    lora_r=lora_r,
+                    lora_alpha=lora_alpha,
+                )
+                for _ in range(num_mask_layers)
+            ]
+        )
+        self.path2_global_blocks = nn.ModuleList(
+            [
+                block_fn(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    init_values=init_values,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                    lora_r=lora_r,
+                    lora_alpha=lora_alpha,
+                )
+                for _ in range(num_mask_layers)
+            ]
+        )
+        # Single DA applied to dynamic tokens after the num_mask_layers layers of Path 2
+        self.path2_da = DeformableTokenAttention(
+            dim=embed_dim,
+            num_heads=num_heads,
+        )
+        # MLP that fuses path1 and path2 dynamic tokens after num_mask_layers layers
+        self.dynamic_fusion_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
 
     def __build_patch_embed__(
         self,
@@ -186,18 +245,20 @@ class Aggregator(nn.Module):
     def forward(self, images: torch.Tensor, dynamic_mask: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
-            images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
-                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
-            dynamic_mask (torch.Tensor, optional): Binary mask [B, S, H, W] where 1 indicates
-                dynamic regions. For the first num_mask_layers layers, dynamic token K vectors
-                are zeroed so static tokens cannot attend to them.
+            images (torch.Tensor): [B, S, 3, H, W], range [0, 1].
+            dynamic_mask (torch.Tensor, optional): [B, S, H, W] binary mask, 1 = dynamic pixel.
+                Enables dual-path processing for the first num_mask_layers layers:
+                  Path 1 (frozen): K-zeroing for dynamic tokens in frame/global attention.
+                  Path 2 (trainable): DeformableAttention for dynamic tokens, no K zeroing.
+                After num_mask_layers layers the two dynamic-token streams are fused via
+                dynamic_fusion_mlp, then processing continues with the standard VGGT flow.
 
         Returns:
-            (list[torch.Tensor], int):
-                The list of outputs from the attention blocks,
-                and the patch_start_idx indicating where patch tokens begin.
+            (list[torch.Tensor], int): aggregated token list and patch_start_idx.
         """
         B, S, C_in, H, W = images.shape
+        H_p = H // self.patch_size
+        W_p = W // self.patch_size
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
@@ -212,7 +273,7 @@ class Aggregator(nn.Module):
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        _, P, C = patch_tokens.shape
+        _, P_patch, C = patch_tokens.shape
 
         # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
@@ -223,11 +284,9 @@ class Aggregator(nn.Module):
 
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+            pos = self.position_getter(B * S, H_p, W_p, device=images.device)
 
         if self.patch_start_idx > 0:
-            # do not use position embedding for special tokens (camera and register tokens)
-            # so set pos to 0 for the special tokens
             pos = pos + 1
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
@@ -235,30 +294,53 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
-        # Compute patch-level key mask for dynamic regions (used in first num_mask_layers layers)
+        # Compute patch-level key mask (Path 1: K zeroing for dynamic tokens)
         patch_key_mask = None
         if dynamic_mask is not None:
             patch_key_mask = self._compute_patch_key_mask(dynamic_mask, B, S, H, W, images.device)
 
+        # Path 2 starts from the same token state as Path 1
+        tokens_p2 = tokens.clone() if (patch_key_mask is not None and self.num_mask_layers > 0) else None
+
         frame_idx = 0
         global_idx = 0
+        p2_frame_idx = 0
+        p2_global_idx = 0
         output_list = []
 
-        for _ in range(self.aa_block_num):
+        for iter_idx in range(self.aa_block_num):
+            use_dual = (tokens_p2 is not None and iter_idx < self.num_mask_layers)
+
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos, patch_key_mask=patch_key_mask
                     )
+                    if use_dual:
+                        tokens_p2, p2_frame_idx, _ = self._process_path2_frame_attention(
+                            tokens_p2, B, S, P, C, p2_frame_idx, pos=pos,
+                        )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos, patch_key_mask=patch_key_mask
                     )
+                    if use_dual:
+                        tokens_p2, p2_global_idx, _ = self._process_path2_global_attention(
+                            tokens_p2, B, S, P, C, p2_global_idx, pos=pos,
+                        )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
+            # After the last dual-path iteration, apply DA to dynamic tokens in path2, then fuse
+            if use_dual and iter_idx == self.num_mask_layers - 1:
+                # Ensure tokens_p2 is in [B*S, P, C] for DA
+                if tokens_p2.shape != (B * S, P, C):
+                    tokens_p2 = tokens_p2.view(B, S, P, C).view(B * S, P, C)
+                tokens_p2 = self.path2_da(tokens_p2, patch_key_mask, self.patch_start_idx, H_p, W_p)
+                tokens = self._fuse_dynamic_tokens(tokens, tokens_p2, patch_key_mask, B, S, P, C)
+                tokens_p2 = None  # free memory; path2 is done
+
             for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
 
@@ -286,6 +368,67 @@ class Aggregator(nn.Module):
         # Camera and register tokens are never masked
         special_false = torch.zeros(B * S, self.patch_start_idx, dtype=torch.bool, device=device)
         return torch.cat([special_false, mask_patch], dim=1)  # [B*S, P]
+
+    def _process_path2_frame_attention(
+        self, tokens, B, S, P, C, p2_frame_idx, pos=None, **kwargs
+    ):
+        """Path-2 frame attention: standard Block with LoRA, no K zeroing."""
+        if tokens.shape != (B * S, P, C):
+            tokens = tokens.view(B, S, P, C).view(B * S, P, C)
+        if pos is not None and pos.shape != (B * S, P, 2):
+            pos = pos.view(B, S, P, 2).view(B * S, P, 2)
+
+        intermediates = []
+        for _ in range(self.aa_block_size):
+            block = self.path2_frame_blocks[p2_frame_idx]
+            if self.training:
+                tokens = checkpoint(
+                    block, tokens, pos, None,
+                    use_reentrant=self.use_reentrant,
+                )
+            else:
+                tokens = block(tokens, pos=pos, key_mask=None)
+            p2_frame_idx += 1
+            intermediates.append(tokens.view(B, S, P, C))
+        return tokens, p2_frame_idx, intermediates
+
+    def _process_path2_global_attention(self, tokens, B, S, P, C, p2_global_idx, pos=None):
+        """Path-2 global attention: standard Block, no K zeroing (key_mask=None)."""
+        if tokens.shape != (B, S * P, C):
+            tokens = tokens.view(B, S, P, C).view(B, S * P, C)
+        if pos is not None and pos.shape != (B, S * P, 2):
+            pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+
+        intermediates = []
+        for _ in range(self.aa_block_size):
+            if self.training:
+                tokens = checkpoint(
+                    self.path2_global_blocks[p2_global_idx], tokens, pos, None,
+                    use_reentrant=self.use_reentrant,
+                )
+            else:
+                tokens = self.path2_global_blocks[p2_global_idx](tokens, pos=pos, key_mask=None)
+            p2_global_idx += 1
+            intermediates.append(tokens.view(B, S, P, C))
+        return tokens, p2_global_idx, intermediates
+
+    def _fuse_dynamic_tokens(self, tokens_p1, tokens_p2, patch_key_mask, B, S, P, C):
+        """
+        Merge path-1 and path-2 dynamic tokens via dynamic_fusion_mlp.
+        Static positions keep path-1 values unchanged.
+        """
+        # Normalise both to [B*S, P, C] (last block may have left them in [B, S*P, C])
+        if tokens_p1.shape != (B * S, P, C):
+            tokens_p1 = tokens_p1.view(B, S, P, C).view(B * S, P, C)
+        if tokens_p2.shape != (B * S, P, C):
+            tokens_p2 = tokens_p2.view(B, S, P, C).view(B * S, P, C)
+
+        merged = tokens_p1.clone()
+        if patch_key_mask.any():
+            dyn_p1 = tokens_p1[patch_key_mask]  # [N_dyn, C]
+            dyn_p2 = tokens_p2[patch_key_mask]  # [N_dyn, C]
+            merged[patch_key_mask] = self.dynamic_fusion_mlp(torch.cat([dyn_p1, dyn_p2], dim=-1))
+        return merged
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, patch_key_mask=None):
         """

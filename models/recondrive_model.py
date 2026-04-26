@@ -34,9 +34,9 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.utils.checkpoint import checkpoint
 
-from models.vggt.models.vggt import VGGT
-from models.vggt.heads.dpt_head import DPTHead
-from models.vggt.heads.gs_dpt_head import VGGT_DPT_GS_Head
+from models.vggt_stage1.models.vggt import VGGT
+from models.vggt_stage1.heads.dpt_head import DPTHead
+from models.vggt_stage1.heads.gs_dpt_head import VGGT_DPT_GS_Head
 from models.gaussian_util import render, focal2fov, getProjectionMatrix, depth2pc, pc2depth, rotate_sh, quat_multiply
 from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss
 from utils.visual_util import predictions_to_glb
@@ -152,11 +152,10 @@ class ReconDriveModel(torch.nn.Module):
         # VGGT_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
         # vggt_model.load_state_dict(torch.hub.load_state_dict_from_url(VGGT_URL))
 
-        vggt_model.load_state_dict(torch.load(vggt_checkpoint))
+        vggt_model.load_state_dict(torch.load(vggt_checkpoint), strict=False)
 
         
-        # self.aggregator = vggt_model.aggregator
-        self.aggregator = apply_lora(vggt_model.aggregator,layer_names=['qkv','proj','fc1','fc2'], dropout=0.05)
+        self.aggregator = vggt_model.aggregator
         verify_frozen_parameters(self.aggregator)
         # self.depth_head = DPTHead(dim_in=2 * self.embed_dim, output_dim=2, activation="sigmoid", conf_activation="expp1")
         self.depth_head = vggt_model.depth_head
