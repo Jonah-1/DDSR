@@ -7,10 +7,10 @@ class DeformableTokenAttention(nn.Module):
     """
     Single-scale deformable attention for dynamic patch tokens on a 2D grid.
 
-    Each dynamic query token predicts `num_points` 2D sampling offsets.
+    Each dynamic query token predicts `num_points` 2D sampling offsets from Q.
     K/V features are bilinearly sampled at those positions from the patch
-    feature map. Attention weights over the sampled points are predicted by
-    a small linear layer (not dot-product, avoiding the need for Q norms).
+    feature map. Attention weights are computed via scaled Q·K dot product
+    over the sampled points (not all tokens).
 
     Only positions where dynamic_mask=True are written to the output;
     all other positions are left unchanged (caller is responsible for merging).
@@ -29,11 +29,12 @@ class DeformableTokenAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.num_points = num_points
+        self.scale = self.head_dim ** -0.5
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        # Jointly predicts 2D offsets (2) and attention weight logit (1) per head per point
-        self.offset_attn = nn.Linear(dim, num_heads * num_points * 3)
+        # Predicts 2D sampling offsets per head per point from Q
+        self.offset_attn = nn.Linear(dim, num_heads * num_points * 2)
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
 
         # Init to zero so training starts from uniform local attention
@@ -52,11 +53,11 @@ class DeformableTokenAttention(nn.Module):
         BS, P, C = x.shape
         dtype = x.dtype
 
-        # Build K/V feature maps from patch tokens
+        # Build K/V feature maps from patch tokens (float32 for grid_sample)
         patch_tokens = x[:, patch_start_idx:]          # [BS, H_p*W_p, C]
         kv = self.kv(patch_tokens)                      # [BS, H_p*W_p, 2C]
-        k_map = kv[..., :C].view(BS, H_p, W_p, C).permute(0, 3, 1, 2)  # [BS, C, H_p, W_p]
-        v_map = kv[..., C:].view(BS, H_p, W_p, C).permute(0, 3, 1, 2)
+        k_map = kv[..., :C].view(BS, H_p, W_p, C).permute(0, 3, 1, 2).float()  # [BS, C, H_p, W_p]
+        v_map = kv[..., C:].view(BS, H_p, W_p, C).permute(0, 3, 1, 2).float()
 
         out = x.clone()
 
@@ -68,10 +69,10 @@ class DeformableTokenAttention(nn.Module):
             N_dyn = dyn_idx.numel()
             x_dyn = x[bs, patch_start_idx + dyn_idx]   # [N_dyn, C]
 
-            # Predict offsets and attention weights
-            raw = self.offset_attn(x_dyn).view(N_dyn, self.num_heads, self.num_points, 3)
-            offsets = raw[..., :2].tanh() * 0.5         # [N_dyn, H, num_pts, 2], range (-0.5, 0.5)
-            attn_w = raw[..., 2].softmax(dim=-1)        # [N_dyn, H, num_pts]
+            # Project to query space, then predict sampling offsets from Q
+            q_dyn = self.q(x_dyn)                       # [N_dyn, C]
+            offsets = self.offset_attn(q_dyn).float().view(N_dyn, self.num_heads, self.num_points, 2).tanh() * 0.5
+            q_dyn = q_dyn.float()
 
             # Reference positions normalised to [-1, 1] for grid_sample (x=w, y=h)
             ref_h = (dyn_idx // W_p).float() / max(H_p - 1, 1) * 2 - 1
@@ -88,21 +89,24 @@ class DeformableTokenAttention(nn.Module):
                 v_h = v_map[bs, s:e].unsqueeze(0).expand(N_dyn, -1, -1, -1)
 
                 grid = coords.unsqueeze(1)  # [N_dyn, 1, num_pts, 2]
-                k_s = F.grid_sample(k_h.float(), grid.float(),
+                k_s = F.grid_sample(k_h, grid,
                                     mode='bilinear', padding_mode='border', align_corners=True)
-                v_s = F.grid_sample(v_h.float(), grid.float(),
+                v_s = F.grid_sample(v_h, grid,
                                     mode='bilinear', padding_mode='border', align_corners=True)
                 # → [N_dyn, head_dim, num_pts]
-                k_s = k_s.squeeze(2).to(dtype)
-                v_s = v_s.squeeze(2).to(dtype)
+                k_s = k_s.squeeze(2)
+                v_s = v_s.squeeze(2)
 
-                # Weighted aggregation
-                aw = attn_w[:, h_idx]                              # [N_dyn, num_pts]
-                head_out = (v_s * aw.unsqueeze(1)).sum(dim=-1)    # [N_dyn, head_dim]
+                # Scaled Q·K dot product over sampled points → attention weights
+                q_head = q_dyn[:, s:e]                                         # [N_dyn, head_dim]
+                attn_w = (q_head.unsqueeze(2) * k_s).sum(dim=1) * self.scale  # [N_dyn, num_pts]
+                attn_w = attn_w.softmax(dim=-1)
+
+                head_out = (v_s * attn_w.unsqueeze(1)).sum(dim=-1)             # [N_dyn, head_dim]
                 head_outputs.append(head_out)
 
             agg = torch.cat(head_outputs, dim=-1)  # [N_dyn, C]
             agg = self.proj(agg)
-            out[bs, patch_start_idx + dyn_idx] = agg
+            out[bs, patch_start_idx + dyn_idx] = agg.to(out.dtype)
 
         return out

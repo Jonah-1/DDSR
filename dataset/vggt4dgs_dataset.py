@@ -77,15 +77,17 @@ class NuScenesdataset4D(Dataset):
         self.dataset = NuScenes(version=self.version, dataroot=self.path, verbose=True)
 
         if stage == 'train':
-            official_scene_names = splits.train  
+            official_scene_names = [
+                'scene-0061', 'scene-0655', 'scene-0757',
+                'scene-0796', 'scene-1077', 'scene-1094',
+            ]
         elif stage == 'val':
-            official_scene_names = splits.val    
+            official_scene_names = [
+                'scene-0916', 'scene-1100',
+            ]
         elif stage == 'test':
             official_scene_names = [
-                'scene-0014', 'scene-0018', 'scene-0906', 'scene-0098',
-                'scene-0100', 'scene-0103', 'scene-0270', 'scene-0271',
-                'scene-0278', 'scene-0553', 'scene-0558', 
-                'scene-0802', 'scene-0968',  'scene-1065',
+                'scene-0103', 'scene-0553',
             ]
         else:
             raise ValueError("stage should be 'train' / 'val'/ 'test' ")

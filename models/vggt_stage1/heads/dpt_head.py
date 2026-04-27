@@ -14,6 +14,7 @@ from typing import List, Dict, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from .head_act import activate_head
 from .utils import create_uv_grid, position_grid_to_embed
 
@@ -108,7 +109,7 @@ class DPTHead(nn.Module):
 
             self.scratch.output_conv2 = nn.Sequential(
                 nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
             )
 
@@ -279,16 +280,31 @@ class DPTHead(nn.Module):
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
 
-        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        size3 = layer_3_rn.shape[2:]
+        if self.training:
+            out = checkpoint(lambda x: self.scratch.refinenet4(x, size=size3), layer_4_rn, use_reentrant=False)
+        else:
+            out = self.scratch.refinenet4(layer_4_rn, size=size3)
         del layer_4_rn, layer_4
 
-        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
+        size2 = layer_2_rn.shape[2:]
+        if self.training:
+            out = checkpoint(lambda x, r: self.scratch.refinenet3(x, r, size=size2), out, layer_3_rn, use_reentrant=False)
+        else:
+            out = self.scratch.refinenet3(out, layer_3_rn, size=size2)
         del layer_3_rn, layer_3
 
-        out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
+        size1 = layer_1_rn.shape[2:]
+        if self.training:
+            out = checkpoint(lambda x, r: self.scratch.refinenet2(x, r, size=size1), out, layer_2_rn, use_reentrant=False)
+        else:
+            out = self.scratch.refinenet2(out, layer_2_rn, size=size1)
         del layer_2_rn, layer_2
 
-        out = self.scratch.refinenet1(out, layer_1_rn)
+        if self.training:
+            out = checkpoint(lambda x, r: self.scratch.refinenet1(x, r), out, layer_1_rn, use_reentrant=False)
+        else:
+            out = self.scratch.refinenet1(out, layer_1_rn)
         del layer_1_rn, layer_1
 
         out = self.scratch.output_conv1(out)
@@ -303,7 +319,7 @@ class DPTHead(nn.Module):
 def _make_fusion_block(features: int, size: int = None, has_residual: bool = True, groups: int = 1) -> nn.Module:
     return FeatureFusionBlock(
         features,
-        nn.ReLU(inplace=True),
+        nn.ReLU(inplace=False),
         deconv=False,
         bn=False,
         expand=False,

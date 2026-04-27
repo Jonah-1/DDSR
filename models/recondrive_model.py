@@ -264,16 +264,18 @@ class ReconDriveModel(torch.nn.Module):
             param.requires_grad = True
         print("All parameters have been unfrozen.")
 
-    def forward(self, images):
+    def forward(self, images, dynamic_mask=None):
         '''
         images: Batch_size, view_num, 3, H, W
-        e2c_extr: Batch_size, view_num, 4, 4
-        K: Batch_size, view_num, 4, 4
+        dynamic_mask: Batch_size, view_num, H, W  bool, 1=dynamic pixel (optional)
         '''
 
         # with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            aggregated_tokens_list, patch_start_idx = self.aggregator(images.to(torch.bfloat16))
+            mask_bf16 = dynamic_mask.to(torch.bfloat16) if dynamic_mask is not None else None
+            aggregated_tokens_list, patch_start_idx = self.aggregator(
+                images.to(torch.bfloat16), dynamic_mask=mask_bf16
+            )
 
         with torch.amp.autocast("cuda", enabled=False):
 
@@ -713,9 +715,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         # Calculate time_delta from context_span (assumes 12Hz sampling rate)
         self.time_delta = getattr(self, 'context_span', 6) / 12.0
+        if not hasattr(self, 'train_4d'):
+            self.train_4d = True
         # Set default for use_vehicle_flow if not in config
         if not hasattr(self, 'use_vehicle_flow'):
             self.use_vehicle_flow = True
+        if not self.train_4d:
+            self.use_vehicle_flow = False
     
     def detect_valid_frames(self, inputs):
         """Dynamically detect valid frames based on actual data shape"""
@@ -782,12 +788,12 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             else:
                 selected_ids = [np.random.choice(6, p=probabilities)]
 
-        # Limit maximum number of selected frames to 4 to avoid CUDA OOM
-        if len(selected_ids) > 4:
+        # Limit maximum number of selected frames to 1 to avoid CUDA OOM
+        if len(selected_ids) > 1:
             if hasattr(self, 'global_rank') and self.global_rank is not None:
-                selected_ids = sorted(rng.choice(selected_ids, size=4, replace=False).tolist())
+                selected_ids = sorted(rng.choice(selected_ids, size=1, replace=False).tolist())
             else:
-                selected_ids = sorted(np.random.choice(selected_ids, size=4, replace=False).tolist())
+                selected_ids = sorted(np.random.choice(selected_ids, size=1, replace=False).tolist())
 
         # Add rank info to debug message for multi-GPU
         if hasattr(self, 'global_rank') and self.global_rank is not None:
@@ -819,13 +825,15 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_project = self.compute_project_loss(batch_render_project_data)
 
 
-        self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
         loss_all = loss_gaussian + loss_depth + loss_project + loss_norm
-        psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
+        self.log(f'{stage}/loss', loss_all.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        with torch.no_grad():
+            psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
 
@@ -900,6 +908,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         # Exclude projection loss from total loss
         loss_all = loss_gaussian + loss_depth + loss_norm + loss_project
+        self.log(f'{stage}/loss', loss_all.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -935,6 +944,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         loss_all = loss_gaussian + loss_depth + loss_norm + loss_project
+        self.log(f'{stage}/loss', loss_all.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1291,6 +1301,55 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         return vehicle_masks
 
     
+    def _extract_dynamic_mask(self, inputs, image_list):
+        """
+        Extract per-pixel dynamic masks for all frames/cameras using SAM2 + vehicle bbox annotations.
+        Returns [B, S, H, W] bool tensor on the same device as image_list, or None if no annotations.
+        """
+        B, S = image_list.shape[:2]
+        H, W = self.height, self.width
+        device = image_list.device
+        dynamic_mask = torch.zeros(B, S, H, W, dtype=torch.bool, device=device)
+        has_any = False
+
+        anno_keys = ['vehicle_annotations_frame_0', f'vehicle_annotations_frame_{self.context_span}', 'vehicle_annotations']
+
+        for b in range(B):
+            for c in range(S):
+                frame_idx = c // self.num_cams
+                cam_idx = c % self.num_cams
+
+                anno_key = f'vehicle_annotations_frame_{frame_idx * self.context_span if frame_idx > 0 else 0}'
+                lookup_idx = cam_idx
+                if anno_key not in inputs:
+                    anno_key = 'vehicle_annotations'
+                    lookup_idx = c
+                if anno_key not in inputs:
+                    continue
+
+                try:
+                    batch_data = inputs[anno_key][b]
+                    if lookup_idx >= len(batch_data):
+                        continue
+                    vehicle_data = batch_data[lookup_idx]
+                    bbox_2d_list = []
+                    if isinstance(vehicle_data, list):
+                        for vehicle in vehicle_data:
+                            if isinstance(vehicle, dict) and 'bbox_2d' in vehicle:
+                                bbox_2d_list.append(vehicle['bbox_2d'])
+                    if not bbox_2d_list:
+                        continue
+                    seg_img = image_list[b, c]
+                    masks = self.segment_vehicles_with_sam2(seg_img, bbox_2d_list)
+                    for mask in masks:
+                        if mask is not None:
+                            dynamic_mask[b, c] |= torch.from_numpy(mask).to(device)
+                            has_any = True
+                except Exception:
+                    continue
+
+        return dynamic_mask if has_any else None
+
     def compute_velocity_flow(self, vehicle_masks, vehicle_velocities, image_shape):
         """
         Assign 3D velocity to vehicle pixels
@@ -1329,14 +1388,18 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             c2e_extr = inputs['c2e_extr'][:, frame_cam_id, ...]
             image_list.append(inputs[(f'color_aug', 0)][:,frame_cam_id,...])
             c2e_extr_list.append(c2e_extr)
-        image_list = torch.stack(image_list,dim=1)
+        image_list = torch.stack(image_list, dim=1)
+
+        # Extract dynamic masks via SAM2 + vehicle bbox annotations
+        dynamic_mask = self._extract_dynamic_mask(inputs, image_list)
 
         # 6 -> 18
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
-        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list)
+        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list, dynamic_mask=dynamic_mask)
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
+        outputs['dynamic_mask'] = dynamic_mask  # [B, S, H, W] bool or None
 
         c2e_extr_list = torch.stack(c2e_extr_list, dim=1) # b, s, 4, 4
 
@@ -2032,6 +2095,16 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 outputs[('gaussian_color', frame_id, cam_id)] = gaussian_color
                 outputs[('warped_mask', frame_id, cam_id)] = mask_warped.detach()
 
+                dyn = recontrast_data.get('dynamic_mask', None)
+                if dyn is not None and frame_id in self.all_context_frame_ids:
+                    input_idx = self.all_context_frame_ids.index(frame_id)
+                    dyn_idx = input_idx * self.num_cams + cam_id
+                    dyn_slice = dyn[:, dyn_idx, :, :]  # [B, H, W]
+                    dyn_slice = F.interpolate(dyn_slice.unsqueeze(1).float(),
+                                              size=(self.render_height, self.render_width),
+                                              mode='nearest')  # [B, 1, H, W]
+                    outputs[('dynamic_mask', frame_id, cam_id)] = dyn_slice
+
         return outputs
     
 
@@ -2094,6 +2167,15 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 outputs[('warped_gt', ref_frame_id, src_frame_id, cam_id)] = ref_colors
                 outputs[('warped_pred', ref_frame_id, src_frame_id, cam_id)] = warped_img
                 outputs[('warped_mask', ref_frame_id, src_frame_id, cam_id)] = warped_mask.detach()
+
+                dyn = recontrast_data.get('dynamic_mask', None)
+                if dyn is not None and ref_frame_id in self.all_context_frame_ids:
+                    input_idx = self.all_context_frame_ids.index(ref_frame_id)
+                    dyn_idx = input_idx * self.num_cams + cam_id
+                    dyn_slice = dyn[:, dyn_idx, :, :]  # [B, H, W]
+                    dyn_slice = F.interpolate(dyn_slice.unsqueeze(1).float(),
+                                              size=(h, w), mode='nearest')  # [B, 1, H, W]
+                    outputs[('dynamic_mask', ref_frame_id, src_frame_id, cam_id)] = dyn_slice
 
                 # Store source colors for visualization (if needed)
                 outputs[('src_colors', src_frame_id, cam_id)] = src_colors
@@ -2277,8 +2359,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         for frame_id in self.all_render_frame_ids:
             for cam_id in range(self.num_cams): 
                 pred = batch_data[('gaussian_color', frame_id, cam_id)]
-                gt = batch_data[('groudtruth', frame_id, cam_id)]  
+                gt = batch_data[('groudtruth', frame_id, cam_id)]
                 mask = batch_data[('warped_mask', frame_id, cam_id)]
+                dyn = batch_data.get(('dynamic_mask', frame_id, cam_id), None)
+                if dyn is not None:
+                    mask = mask * (1.0 - dyn)
 
                 lpips_loss = self.lpips(pred, gt, normalize=True)
                 # lpips_loss = 0.0
@@ -2308,6 +2393,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 pred = batch_data[('warped_pred', ref_frame_id, src_frame_id, cam_id)]
                 gt = batch_data[('warped_gt', ref_frame_id, src_frame_id, cam_id)]
                 mask = batch_data[('warped_mask', ref_frame_id, src_frame_id, cam_id)]
+                dyn = batch_data.get(('dynamic_mask', ref_frame_id, src_frame_id, cam_id), None)
+                if dyn is not None:
+                    mask = mask * (1.0 - dyn)
 
                 # img_loss = compute_photometric_loss(pred, gt)
                 l1_loss = self.l1_fn(pred, gt)

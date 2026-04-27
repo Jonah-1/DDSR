@@ -81,6 +81,18 @@
 
 ---
 
+## Loss 计算中的动态区域排除
+
+`compute_gaussian_loss` 和 `compute_project_loss` 均已加入动态掩码排除逻辑：
+
+- `render_splating_imgs`：对每个 `(frame_id, cam_id)` 从 `recontrast_data['dynamic_mask']`（shape `[B, S, H, W]`）中取对应切片（索引 = `frame_id × num_cams + cam_id`），resize 至渲染分辨率后存为 `('dynamic_mask', frame_id, cam_id)`
+- `render_project_imgs`：同理，取 `ref_frame_id`（固定 0）对应的动态掩码，存为 `('dynamic_mask', ref_frame_id, src_frame_id, cam_id)`
+- Loss 函数中：`mask = warped_mask × (1 − dynamic_mask)`，动态区域权重置零
+
+若 SAM2 未检测到任何动态物体（`dynamic_mask is None`），行为与原逻辑完全一致。
+
+---
+
 ## 相关文件
 
 | 文件 | 说明 |

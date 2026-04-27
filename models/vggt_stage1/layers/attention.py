@@ -99,7 +99,7 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None, pos=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, pos=None, key_mask: Optional[Tensor] = None) -> Tensor:
         assert pos is None
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:

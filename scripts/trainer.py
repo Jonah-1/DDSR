@@ -8,6 +8,7 @@ import yaml
 import argparse
 import os
 import sys
+
 import subprocess
 import torch
 from pathlib import Path
@@ -44,12 +45,14 @@ def main():
     parser.add_argument('--pretrained_ckpt', type=str, default='')
     parser.add_argument('--train_4d', action='store_true', help='4dgs')
     parser.add_argument('--devices', type=int, default=None, help='Number of GPUs to use (overrides config)')
+    parser.add_argument('--ckpt_dir', type=str, default=None, help='Override checkpoint save directory')
     args = parser.parse_args()
 
     with open(args.cfg_path) as f:
         main_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
     main_cfg['model_cfg']['batch_size'] = main_cfg['data_cfg']['batch_size']
+    main_cfg['model_cfg']['train_4d'] = args.train_4d
 
     # Override devices if specified via command line
     if args.devices is not None:
@@ -58,10 +61,10 @@ def main():
     else:
         print(f"Using {main_cfg['devices']} GPU(s) from config file")
 
-    save_dir = main_cfg['save_dir']
+    save_dir = os.path.abspath(main_cfg['save_dir'])
 
     log_dir = os.path.join(save_dir, 'log')
-    ckpt_dir = os.path.join(save_dir, 'ckpt')
+    ckpt_dir = os.path.abspath(args.ckpt_dir) if args.ckpt_dir else os.path.join(save_dir, 'ckpt')
     code_dir = os.path.join(save_dir, 'code')
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -77,10 +80,9 @@ def main():
         name='logs'
     )
 
-    if args.train_4d:
-        data_module = VGGT4DGS_LITDataModule(
-            cfg=main_cfg['data_cfg'],
-        )
+    data_module = VGGT4DGS_LITDataModule(
+        cfg=main_cfg['data_cfg'],
+    )
 
     if args.pretrained_ckpt:
         litmodel = ReconDrive_LITModelModule(
@@ -103,14 +105,14 @@ def main():
         monitor="val/psnr",
         mode="max",
         save_last=True,
-        every_n_epochs=1
+        every_n_epochs=2
     )
 
     periodic_checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename='epoch_{epoch:02d}',
         save_top_k=-1,
-        every_n_epochs=1,
+        every_n_epochs=2,
         save_last=False,
     )
 
@@ -132,7 +134,7 @@ def main():
         gradient_clip_val=1.0,
         callbacks=[checkpoint_callback, periodic_checkpoint_callback, LearningRateMonitor(), export_metric_callback],
         deterministic=True,
-        log_every_n_steps=100,
+        log_every_n_steps=1,
         enable_progress_bar=True,
         enable_model_summary=True,
         strategy='ddp_find_unused_parameters_true',
@@ -143,11 +145,10 @@ def main():
     torch.use_deterministic_algorithms(mode=True,warn_only=True)
     trainer.fit(litmodel, data_module)
 
-    data_module.setup(stage='test')
-
-    print(f"\nTesting best model...{checkpoint_callback.best_model_path}")
-    best_model = ReconDrive_LITModelModule.load_from_checkpoint(checkpoint_callback.best_model_path)
-    trainer.test(best_model, data_module)
+    # data_module.setup(stage='test')
+    # print(f"\nTesting best model...{checkpoint_callback.best_model_path}")
+    # best_model = ReconDrive_LITModelModule.load_from_checkpoint(checkpoint_callback.best_model_path)
+    # trainer.test(best_model, data_module)
 
 if __name__ == "__main__":
     main()

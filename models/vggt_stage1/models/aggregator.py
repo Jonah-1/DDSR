@@ -427,7 +427,7 @@ class Aggregator(nn.Module):
         if patch_key_mask.any():
             dyn_p1 = tokens_p1[patch_key_mask]  # [N_dyn, C]
             dyn_p2 = tokens_p2[patch_key_mask]  # [N_dyn, C]
-            merged[patch_key_mask] = self.dynamic_fusion_mlp(torch.cat([dyn_p1, dyn_p2], dim=-1))
+            merged[patch_key_mask] = self.dynamic_fusion_mlp(torch.cat([dyn_p1, dyn_p2], dim=-1)).to(merged.dtype)
         return merged
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, patch_key_mask=None):
