@@ -84,7 +84,7 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
     elif activation == "norm":
         pts3d = xyz / xyz.norm(dim=-1, keepdim=True)
     elif activation == "exp":
-        pts3d = torch.exp(xyz)
+        pts3d = torch.exp(xyz.clamp(max=10))   #防止输出NAN值
     elif activation == "relu":
         pts3d = F.relu(xyz)
     elif activation == "inv_log":
@@ -101,7 +101,7 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
         raise ValueError(f"Unknown activation: {activation}")
 
     if conf_activation == "expp1":
-        conf_out = 1 + conf.exp()
+        conf_out = 1 + conf.clamp(max=10).exp() #防止输出NAN值
     elif conf_activation == "expp0":
         conf_out = conf.exp()
     elif conf_activation == "sigmoid":

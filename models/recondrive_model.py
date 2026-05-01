@@ -41,6 +41,7 @@ from models.gaussian_util import render, focal2fov, getProjectionMatrix, depth2p
 from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss
 from utils.visual_util import predictions_to_glb
 from models.geometry_util import Projection
+from models.debug_visualizer import create_debug_visualizer
 
 from models.gaussian_util import render, focal2fov, getProjectionMatrix,  depth2pc, pc2depth, rotate_sh, quat_multiply
 
@@ -189,72 +190,71 @@ class ReconDriveModel(torch.nn.Module):
 
     def freeze_parameters_except_heads(self):
         """
-        Freeze all model parameters except those in depth_head and gs_head.
-        This allows depth estimation and 3D Gaussian Splatting heads to be trained while keeping other components frozen.
+        Trainable parameters:
+          - depth_head, gs_head  (全部)
+          - aggregator.frame_blocks[11,17,23]  (仅 lora_* 权重)
+          - aggregator.global_blocks[11,17,23] (仅 lora_* 权重)
+          - aggregator.path2_frame_blocks      (仅 lora_* 权重)
+          - aggregator.path2_global_blocks     (仅 lora_* 权重)
+          - aggregator.path2_da               (全部)
+          - aggregator.dynamic_fusion_mlp     (全部)
+        其余全部冻结。
         """
-        # Count parameters before freezing
-        total_params = 0
-        trainable_params_before = 0
-        trainable_params_after = 0
+        MAIN_LORA_INDICES = set(range(3, 24))  # layers 4-24 (1-indexed), i.e. all LoRA-capable layers
 
+        def _is_trainable(name: str) -> bool:
+            if name.startswith('depth_head') or name.startswith('gs_head'):
+                return True
+            if 'aggregator.path2_da.' in name:
+                return True
+            if 'aggregator.dynamic_fusion_mlp.' in name:
+                return True
+            if ('aggregator.path2_frame_blocks.' in name or
+                    'aggregator.path2_global_blocks.' in name):
+                return 'lora_' in name
+            for block_type in ('frame_blocks', 'global_blocks'):
+                prefix = f'aggregator.{block_type}.'
+                if prefix in name and 'lora_' in name:
+                    rest = name.split(prefix)[1]
+                    idx_str = rest.split('.')[0]
+                    if idx_str.isdigit() and int(idx_str) in MAIN_LORA_INDICES:
+                        return True
+            return False
+
+        total = trainable = 0
         for name, param in self.named_parameters():
-            total_params += param.numel()
+            total += param.numel()
+            param.requires_grad = _is_trainable(name)
             if param.requires_grad:
-                trainable_params_before += param.numel()
-
-        # Freeze all parameters first
-        for param in self.parameters():
-            param.requires_grad = False
-
-        # Unfreeze depth_head parameters
-        for name, param in self.depth_head.named_parameters():
-            param.requires_grad = True
-            trainable_params_after += param.numel()
-
-        # Unfreeze gs_head (3DGS) parameters
-        for name, param in self.gs_head.named_parameters():
-            param.requires_grad = True
-            trainable_params_after += param.numel()
+                trainable += param.numel()
 
         print(f"Parameter freezing summary:")
-        print(f"  Total parameters: {total_params:,}")
-        print(f"  Trainable parameters before: {trainable_params_before:,}")
-        print(f"  Trainable parameters after (depth_head + gs_head): {trainable_params_after:,}")
-        print(f"  Trainable percentage: {trainable_params_after/total_params*100:.2f}%")
-        print(f"  Only depth_head and gs_head (3DGS) parameters are trainable.")
+        print(f"  Total:     {total:,}")
+        print(f"  Trainable: {trainable:,}  ({trainable/total*100:.2f}%)")
+        print(f"  Trainable scope:")
+        print(f"    depth_head, gs_head (all params)")
+        print(f"    frame_blocks / global_blocks [11,17,23] (lora only)")
+        print(f"    path2_frame_blocks / path2_global_blocks (lora only)")
+        print(f"    path2_da, dynamic_fusion_mlp (all params)")
 
-        # Verify that only specified heads parameters are trainable
-        self.verify_frozen_heads_parameters()
-
-    def verify_frozen_heads_parameters(self):
-        """
-        Verify that only depth_head and gs_head parameters are trainable.
-        """
-        depth_head_trainable = 0
-        gs_head_trainable = 0
-        other_trainable = 0
-        other_trainable_names = []
-
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                if name.startswith('depth_head'):
-                    depth_head_trainable += param.numel()
-                elif name.startswith('gs_head'):
-                    gs_head_trainable += param.numel()
-                else:
-                    other_trainable += param.numel()
-                    other_trainable_names.append(name)
-
-        if other_trainable == 0:
-            print(f"✓ Verification passed: Only depth_head and gs_head are trainable")
-            print(f"  - depth_head: {depth_head_trainable:,} parameters")
-            print(f"  - gs_head: {gs_head_trainable:,} parameters")
-        else:
-            print(f"✗ Verification failed: {other_trainable:,} non-target parameters are trainable")
-            for name in other_trainable_names[:5]:  # Show first 5
-                print(f"    - {name}")
-            if len(other_trainable_names) > 5:
-                print(f"    ... and {len(other_trainable_names) - 5} more")
+    def load_pretrained_checkpoint(self, checkpoint_path, strict=False, verbose=True):
+        """Load checkpoint into ReconDriveModel. Strips 'model.' prefix if present."""
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        src_sd = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
+        # strip leading 'model.' (LITModule saves with this prefix)
+        src_sd = {(k[6:] if k.startswith('model.') else k): v for k, v in src_sd.items()}
+        cur_sd = self.state_dict()
+        matched, unmatched = {}, []
+        for k, v in src_sd.items():
+            if k in cur_sd and cur_sd[k].shape == v.shape:
+                matched[k] = v
+            else:
+                unmatched.append(k)
+        self.load_state_dict(matched, strict=False)
+        if verbose:
+            print(f"[ReconDriveModel] Loaded {len(matched)}/{len(src_sd)} params from {checkpoint_path}")
+            if unmatched:
+                print(f"  Unmatched: {len(unmatched)} keys")
 
     def unfreeze_all_parameters(self):
         """
@@ -568,6 +568,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
     def __init__(self, cfg, save_dir='.', logger=None):
         super().__init__()
         self.read_config(cfg)
+        self._cfg_context_span = getattr(self, 'context_span', 6)
 
         # Set default values for ego transformation configuration if not in config
         if not hasattr(self, 'translate_3dgs'):
@@ -585,6 +586,12 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.flow_reg_coeff = 0.005
         self.init_novel_view_mode()
         self.save_hyperparameters('cfg','save_dir')
+
+        # Debug visualizer (only rank 0 saves)
+        debug_output_dir = getattr(self, 'debug_output_dir', 'work_dirs/debug_outputs')
+        debug_max_samples = getattr(self, 'debug_max_samples', 2)
+        self.debug_visualizer = create_debug_visualizer({'debug_output_dir': debug_output_dir, 'debug_max_samples': debug_max_samples})
+        self.debug_log_frequency = getattr(self, 'debug_log_frequency', 50)
         
         # Initialize SAM2 for vehicle segmentation
         self.sam2_predictor = None
@@ -599,16 +606,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.compute_alternative_flow = cfg.get('model_cfg', {}).get('compute_alternative_flow', False)  # Mode 2 flow for comparison
     
     def load_pretrained_checkpoint(self, checkpoint_path, strict=False, verbose=True):
-       
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
         if strict:
-            
             self.load_state_dict(checkpoint['state_dict'])
             if verbose:
                 print(f"strict mode loading checkpoint: {checkpoint_path}")
         else:
-            
             current_state_dict = self.state_dict()
             pretrained_state_dict = checkpoint['state_dict']
 
@@ -624,8 +629,12 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 else:
                     unmatched_params.append(f"{name}: not found in current model")
 
-            
             self.load_state_dict(matched_params, strict=False)
+            if verbose:
+                print(f"Loaded {len(matched_params)} / {len(pretrained_state_dict)} params from {checkpoint_path}")
+                if unmatched_params:
+                    print(f"  Unmatched: {len(unmatched_params)} params")
+
 
         
     
@@ -741,9 +750,15 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         # Detect valid frames with actual data
         valid_frames = self.detect_valid_frames(inputs)
         
+        # Cap to configured context_span so inference matches training behaviour.
+        # all_dict may contain more frames (e.g. 13 for a ±6 window) but
+        # ego_T_ego is only precomputed up to the configured context_span.
+        cfg_span = getattr(self, '_cfg_context_span', 6)
+        valid_frames = [f for f in valid_frames if f <= cfg_span]
+
         # Update render frame IDs based on actual valid frames
         self.all_render_frame_ids = valid_frames
-        self.context_span = len(valid_frames) - 1
+        self.context_span = cfg_span
         
         # Context frames are always first and last valid frames
         if len(valid_frames) >= 2:
@@ -756,7 +771,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
     # TODO: Hardcode setting here
     def prob_sample_rendered_ids(self):
-        prob_all_render_frame_ids = [0.7, 0.3, 0.2, 0.1, 0.1, 0.05, 0]
+        prob_all_render_frame_ids = [0.7, 0.3, 0.2, 0.1, 0.1, 0.2, 0.6]
 
         # For multi-GPU training: use different random values for each GPU
         # Get the global rank to ensure different GPUs get different samples
@@ -789,7 +804,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 selected_ids = [np.random.choice(6, p=probabilities)]
 
         # Limit maximum number of selected frames to 1 to avoid CUDA OOM
-        if len(selected_ids) > 1:
+        if len(selected_ids) > 4:
             if hasattr(self, 'global_rank') and self.global_rank is not None:
                 selected_ids = sorted(rng.choice(selected_ids, size=1, replace=False).tolist())
             else:
@@ -834,6 +849,19 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.log(f'{stage}/loss', loss_all.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         with torch.no_grad():
             psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
+
+        # Save debug images periodically on rank 0 only
+        if self.global_rank == 0 and self.global_step % self.debug_log_frequency == 0:
+            with torch.no_grad():
+                gt_images = {('gt_image', fid, cid): batch_splating_data[('groudtruth', fid, cid)]
+                             for fid in self.all_render_frame_ids
+                             for cid in range(self.num_cams)
+                             if ('groudtruth', fid, cid) in batch_splating_data}
+                self.debug_visualizer.log_step(
+                    global_step=self.global_step,
+                    batch_splating_data=batch_splating_data,
+                    gt_images=gt_images,
+                )
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
 
@@ -2134,7 +2162,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             ref_depths = rearrange(recontrast_data['pred_depths'],'b (c h w) -> b c h w',c=context_s,h=height,w=width)[:, ref_frame_id*self.num_cams+cam_id, ...]
             ref_depths = ref_depths.unsqueeze(1)
             if 'mask' in all_dict:
-                ref_mask = all_dict['mask'][:, ref_all_dict_idx]
+                ref_mask = all_dict['mask'][:, ref_all_dict_idx].unsqueeze(1)  # [B, 1, H, W]
             else:
                 ref_mask = torch.ones_like(ref_depths)
             ref_K = all_dict['K'][:, ref_all_dict_idx, ]
@@ -2415,6 +2443,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         for frame_id in self.all_render_frame_ids:
             for cam_id in range(self.num_cams):
+                if ('gt_depths', frame_id, cam_id) not in batch_recontrast_data:
+                    continue
                 gt_depth = batch_recontrast_data[('gt_depths', frame_id, cam_id)]
                 pred_depth = batch_recontrast_data[('projected_depths', frame_id, cam_id)]
                 gaussian_color = batch_recontrast_data[('gaussian_color', frame_id, cam_id)]
@@ -2437,7 +2467,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
                 count += 1
 
-        return   depth_loss / count
+        if count == 0:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return depth_loss / count
 
     def compute_norm_loss(self, batch_data):
 
@@ -2475,9 +2507,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         ssim /= novel_count
         lpips /= novel_count
 
-        self.log(f"{stage}/psnr", psnr.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log(f"{stage}/ssim", ssim.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log(f"{stage}/lpips", lpips.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        on_epoch = stage != 'train'
+        self.log(f"{stage}/psnr", psnr.item(), on_step=True, on_epoch=on_epoch, prog_bar=True, sync_dist=True)
+        self.log(f"{stage}/ssim", ssim.item(), on_step=True, on_epoch=on_epoch, prog_bar=True, sync_dist=True)
+        self.log(f"{stage}/lpips", lpips.item(), on_step=True, on_epoch=on_epoch, prog_bar=True, sync_dist=True)
         return psnr, ssim, lpips
     
 

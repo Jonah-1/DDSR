@@ -47,6 +47,7 @@ class Block(nn.Module):
         rope=None,
         lora_r: int = 0,
         lora_alpha: float = 1.0,
+        lora_zero_init: bool = False,
     ) -> None:
         super().__init__()
 
@@ -64,6 +65,7 @@ class Block(nn.Module):
             rope=rope,
             lora_r=lora_r,
             lora_alpha=lora_alpha,
+            lora_zero_init=lora_zero_init,
         )
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()

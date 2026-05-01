@@ -69,11 +69,9 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
-        num_mask_layers=6,
+        num_mask_layers=3,
         lora_r=8,
         lora_alpha=16.0,
-        main_lora_r=0,
-        main_lora_alpha=1.0,
     ):
         super().__init__()
 
@@ -84,6 +82,7 @@ class Aggregator(nn.Module):
         self.position_getter = PositionGetter() if self.rope is not None else None
 
         self.frame_blocks = nn.ModuleList(
+            # Path-1 layers: no LoRA (frozen base weights are sufficient)
             [
                 block_fn(
                     dim=embed_dim,
@@ -95,14 +94,31 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
-                    lora_r=main_lora_r,
-                    lora_alpha=main_lora_alpha,
+                    lora_r=0,
                 )
-                for _ in range(depth)
+                for _ in range(num_mask_layers)
+            ] +
+            # Subsequent layers: with LoRA
+            [
+                block_fn(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    init_values=init_values,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                    lora_r=lora_r,
+                    lora_alpha=lora_alpha,
+                )
+                for _ in range(depth - num_mask_layers)
             ]
         )
 
         self.global_blocks = nn.ModuleList(
+            # Path-1 layers: no LoRA
             [
                 block_fn(
                     dim=embed_dim,
@@ -114,10 +130,26 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
-                    lora_r=main_lora_r,
-                    lora_alpha=main_lora_alpha,
+                    lora_r=0,
                 )
-                for _ in range(depth)
+                for _ in range(num_mask_layers)
+            ] +
+            # Subsequent layers: with LoRA
+            [
+                block_fn(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    init_values=init_values,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                    lora_r=lora_r,
+                    lora_alpha=lora_alpha,
+                )
+                for _ in range(depth - num_mask_layers)
             ]
         )
 
@@ -167,6 +199,7 @@ class Aggregator(nn.Module):
                     rope=self.rope,
                     lora_r=lora_r,
                     lora_alpha=lora_alpha,
+                    lora_zero_init=True,  # path2 LoRA starts at zero
                 )
                 for _ in range(num_mask_layers)
             ]
@@ -185,6 +218,7 @@ class Aggregator(nn.Module):
                     rope=self.rope,
                     lora_r=lora_r,
                     lora_alpha=lora_alpha,
+                    lora_zero_init=True,  # path2 LoRA starts at zero
                 )
                 for _ in range(num_mask_layers)
             ]
@@ -481,6 +515,55 @@ class Aggregator(nn.Module):
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+
+    def freeze_for_training(self, trainable_subsequent_layers=(12, 18, 24)):
+        """
+        Set up trainable parameters for stage-1 training:
+
+        Frozen (requires_grad=False):
+          - patch_embed, camera_token, register_token
+          - frame_blocks / global_blocks: ALL base weights
+          - frame_blocks / global_blocks: LoRA of layers NOT in trainable_subsequent_layers
+
+        Trainable (requires_grad=True):
+          - path2_frame_blocks / path2_global_blocks: all LoRA weights
+          - path2_da, dynamic_fusion_mlp: all weights
+          - frame_blocks[i-1] / global_blocks[i-1] LoRA for each i in
+            trainable_subsequent_layers (1-indexed, so layer 12 → index 11)
+
+        Args:
+            trainable_subsequent_layers: 1-indexed layer numbers whose LoRA
+                weights should be trained (default: 12, 18, 24).
+        """
+        # Freeze everything first
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        # Unfreeze path2 LoRA
+        for block in (*self.path2_frame_blocks, *self.path2_global_blocks):
+            for name, p in block.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad_(True)
+
+        # Unfreeze path2_da and fusion MLP entirely
+        for p in self.path2_da.parameters():
+            p.requires_grad_(True)
+        for p in self.dynamic_fusion_mlp.parameters():
+            p.requires_grad_(True)
+
+        # Unfreeze LoRA in the specified subsequent layers (1-indexed → 0-indexed)
+        for layer_1idx in trainable_subsequent_layers:
+            idx = layer_1idx - 1
+            for block in (self.frame_blocks[idx], self.global_blocks[idx]):
+                for name, p in block.named_parameters():
+                    if "lora_" in name:
+                        p.requires_grad_(True)
+
+    def get_trainable_param_count(self):
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        return trainable, total
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

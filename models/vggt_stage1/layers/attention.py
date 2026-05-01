@@ -35,6 +35,7 @@ class Attention(nn.Module):
         rope=None,
         lora_r: int = 0,
         lora_alpha: float = 1.0,
+        lora_zero_init: bool = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -58,10 +59,17 @@ class Attention(nn.Module):
             self.lora_qkv_B = nn.Linear(lora_r, dim * 3, bias=False)
             self.lora_proj_A = nn.Linear(dim, lora_r, bias=False)
             self.lora_proj_B = nn.Linear(lora_r, dim, bias=False)
-            nn.init.kaiming_uniform_(self.lora_qkv_A.weight, a=5 ** 0.5)
-            nn.init.zeros_(self.lora_qkv_B.weight)
-            nn.init.kaiming_uniform_(self.lora_proj_A.weight, a=5 ** 0.5)
-            nn.init.zeros_(self.lora_proj_B.weight)
+            if lora_zero_init:
+                # Both A and B start at zero → LoRA contribution is zero at init
+                nn.init.zeros_(self.lora_qkv_A.weight)
+                nn.init.zeros_(self.lora_qkv_B.weight)
+                nn.init.zeros_(self.lora_proj_A.weight)
+                nn.init.zeros_(self.lora_proj_B.weight)
+            else:
+                nn.init.kaiming_uniform_(self.lora_qkv_A.weight, a=5 ** 0.5)
+                nn.init.zeros_(self.lora_qkv_B.weight)
+                nn.init.kaiming_uniform_(self.lora_proj_A.weight, a=5 ** 0.5)
+                nn.init.zeros_(self.lora_proj_B.weight)
 
     def forward(self, x: Tensor, pos=None, key_mask: Optional[Tensor] = None) -> Tensor:
         B, N, C = x.shape

@@ -16,7 +16,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 # Add models directory to path for vggt imports
 project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root / "models"))
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / "models"))
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -43,9 +44,11 @@ def main():
     parser = argparse.ArgumentParser(description='eval argparse')
     parser.add_argument('--cfg_path', type=str, required=True, help='Main config file path')
     parser.add_argument('--pretrained_ckpt', type=str, default='')
+    parser.add_argument('--lora_ckpt', type=str, default='', help='LoRA weights checkpoint (lora_converted.pt)')
     parser.add_argument('--train_4d', action='store_true', help='4dgs')
     parser.add_argument('--devices', type=int, default=None, help='Number of GPUs to use (overrides config)')
     parser.add_argument('--ckpt_dir', type=str, default=None, help='Override checkpoint save directory')
+    parser.add_argument('--resume_ckpt', type=str, default=None, help='Resume training from checkpoint (restores epoch, optimizer, lr scheduler)')
     args = parser.parse_args()
 
     with open(args.cfg_path) as f:
@@ -98,6 +101,9 @@ def main():
             logger=logger
         )
 
+    if args.lora_ckpt:
+        litmodel.model.load_pretrained_checkpoint(args.lora_ckpt, strict=False, verbose=True)
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename='best_module',
@@ -105,15 +111,7 @@ def main():
         monitor="val/psnr",
         mode="max",
         save_last=True,
-        every_n_epochs=2
-    )
-
-    periodic_checkpoint_callback = ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename='epoch_{epoch:02d}',
-        save_top_k=-1,
-        every_n_epochs=2,
-        save_last=False,
+        every_n_epochs=1
     )
 
     export_metric_callback = ExportMetricCallback(
@@ -130,11 +128,11 @@ def main():
         devices=main_cfg['devices'],
         precision="32-true",
         gradient_clip_algorithm="norm",
-        accumulate_grad_batches=8,
+        accumulate_grad_batches=4,
         gradient_clip_val=1.0,
-        callbacks=[checkpoint_callback, periodic_checkpoint_callback, LearningRateMonitor(), export_metric_callback],
+        callbacks=[checkpoint_callback, LearningRateMonitor(), export_metric_callback],
         deterministic=True,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
         enable_progress_bar=True,
         enable_model_summary=True,
         strategy='ddp_find_unused_parameters_true',
@@ -143,7 +141,7 @@ def main():
     )
 
     torch.use_deterministic_algorithms(mode=True,warn_only=True)
-    trainer.fit(litmodel, data_module)
+    trainer.fit(litmodel, data_module, ckpt_path=args.resume_ckpt)
 
     # data_module.setup(stage='test')
     # print(f"\nTesting best model...{checkpoint_callback.best_model_path}")

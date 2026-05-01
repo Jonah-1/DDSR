@@ -179,7 +179,8 @@ def render_novel_views(model, recontrast_data, render_data, device, scene_name, 
     num_cams = getattr(model, 'num_cams', 6)
     model_width = getattr(model, 'width', 518)
     model_height = getattr(model, 'height', 280)
-    for transform_name, transform_matrix in translation_transforms.items():
+    if eval_resolution == 'original':
+        eval_resolution = f'{model_height}x{model_width}'
         transform_matrix = transform_matrix.to(device)
         for frame_id in novel_render_frames:
             for cam_id in range(num_cams):
@@ -221,6 +222,7 @@ def render_novel_views(model, recontrast_data, render_data, device, scene_name, 
                     save_rendered_image(render_rgb, save_path, upsample_to=(resize_height, resize_width))
                 else:  # eval_resolution == 'original'
                     save_rendered_image(render_rgb, save_path)
+                saved_paths.append(save_path)
         
     return saved_paths
 
@@ -338,9 +340,8 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
 
         model_width = getattr(model, 'width', 518)
         model_height = getattr(model, 'height', 280)
-
-
-        if isinstance(output, tuple):
+        if eval_resolution == 'original':
+            eval_resolution = f'{model_height}x{model_width}'
             batch_recontrast_data, batch_render_data, batch_splating_data = output
             
             # Calculate metrics for this batch

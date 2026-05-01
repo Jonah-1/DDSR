@@ -29,8 +29,8 @@ ReconDrive 推理与高斯保存工具集。
 # NuScenes
 python scripts/inference.py \
     --cfg_path configs/nuscenes/recondrive.yaml \
-    --restore_ckpt checkpoints/recondrive_stage2.ckpt \
-    --output_dir work_dirs/inference_results
+    --restore_ckpt /train-syncdata/jinheng.li/project/DDSR/v1_4.27/ckpt/best_module.ckpt \
+    --output_dir /home/jinheng.li/project/DDSR/work_dirs/inference_results
 
 # CVG（config 中 datamodule_type: cvg）
 python scripts/inference.py \
