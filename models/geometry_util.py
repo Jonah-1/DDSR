@@ -75,13 +75,8 @@ class Projection(nn.Module):
         """
         This function reprojects transformed 3D points to 2D image coordinate.
         """
-        # K may be [B, 4, 4] (stored as homogeneous) or [B, 3, 3]; always use 3x3 intrinsics
-        K_3x3 = K[:, :3, :3]
-        if T.shape[-2] == 4 and T.shape[-1] == 4:
-            T_3x4 = T[:, :3, :]  # [B, 3, 4]
-            points2D = (K_3x3 @ T_3x4) @ points3D
-        else:
-            points2D = (K_3x3 @ T) @ points3D
+        # project points 
+        points2D = (K @ T)[:,:3, :] @ points3D
 
         norm_points2D = points2D[:, :2, :]/(points2D[:, 2:, :] + 1e-7)
         bs = norm_points2D.shape[0]

@@ -32,12 +32,6 @@ def transform_mask_sample(sample, data_transform):
 
 def stack_sample(sample):
     """Stack a sample from multiple sensors"""
-    if len(sample) == 1:
-        single_sample = sample[0]
-        if 'timestamp' in single_sample and not isinstance(single_sample['timestamp'], np.ndarray):
-            single_sample['timestamp'] = np.array([single_sample['timestamp']], dtype=np.int64)
-        return single_sample
-
     stacked_sample = {}
     for key in sample[0]:
         if key in ['idx', 'dataset_idx', 'sensor_name', 'filename', 'token', 'scene_token', 'scene_name', 'scene_idx']:

@@ -3,3 +3,5 @@ data
 __pycache__/
 *.pyc
 work_dirs
+segment-anything-2
+history

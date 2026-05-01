@@ -771,7 +771,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
     # TODO: Hardcode setting here
     def prob_sample_rendered_ids(self):
-        prob_all_render_frame_ids = [0.7, 0.3, 0.2, 0.1, 0.1, 0.2, 0.6]
+        prob_all_render_frame_ids =[0.7, 0.3, 0.2, 0.1, 0.1, 0.05, 0]
 
         # For multi-GPU training: use different random values for each GPU
         # Get the global rank to ensure different GPUs get different samples
@@ -1145,36 +1145,34 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             if checkpoint and not os.path.isabs(checkpoint):
                 checkpoint = os.path.join(sam2_dir, checkpoint)
 
+            # build_sam2 uses hydra compose which requires a relative config name
+            # (relative to the sam2 package configs/ dir), not an absolute path
+            if model_cfg and os.path.isabs(model_cfg):
+                model_cfg = os.path.relpath(model_cfg, os.path.join(sam2_dir, 'sam2'))
+
             # Check if files exist
             if checkpoint and os.path.exists(checkpoint):
-                # Temporarily disable deterministic algorithms for SAM2 initialization
                 prev_det = torch.are_deterministic_algorithms_enabled()
                 if prev_det:
                     torch.use_deterministic_algorithms(False)
 
-                # Change to SAM2 directory for config loading
                 original_dir = os.getcwd()
                 os.chdir(sam2_dir)
+                try:
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    sam2_model = build_sam2(model_cfg, checkpoint)
+                    sam2_model = sam2_model.to(device)
 
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                sam2_model = build_sam2(model_cfg, checkpoint)
-                sam2_model = sam2_model.to(device)
+                    sam2_model.eval()
+                    for param in sam2_model.parameters():
+                        param.requires_grad = False
 
-                # Freeze SAM2 model parameters to prevent training
-                sam2_model.eval()
-                for param in sam2_model.parameters():
-                    param.requires_grad = False
-
-                self.sam2_predictor = SAM2ImagePredictor(sam2_model)
-
-                # Change back to original directory
-                os.chdir(original_dir)
-
-                # Restore deterministic setting
-                if prev_det:
-                    torch.use_deterministic_algorithms(True, warn_only=True)
-
-                print("SAM2 initialized and frozen (not trainable)")
+                    self.sam2_predictor = SAM2ImagePredictor(sam2_model)
+                    print("SAM2 initialized and frozen (not trainable)")
+                finally:
+                    os.chdir(original_dir)
+                    if prev_det:
+                        torch.use_deterministic_algorithms(True, warn_only=True)
             else:
                 self.sam2_predictor = None
         except Exception:
@@ -2162,7 +2160,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             ref_depths = rearrange(recontrast_data['pred_depths'],'b (c h w) -> b c h w',c=context_s,h=height,w=width)[:, ref_frame_id*self.num_cams+cam_id, ...]
             ref_depths = ref_depths.unsqueeze(1)
             if 'mask' in all_dict:
-                ref_mask = all_dict['mask'][:, ref_all_dict_idx].unsqueeze(1)  # [B, 1, H, W]
+                ref_mask = all_dict['mask'][:, ref_all_dict_idx]
+                if ref_mask.dim() == 3:
+                    ref_mask = ref_mask.unsqueeze(1)  # [B, 1, H, W]
             else:
                 ref_mask = torch.ones_like(ref_depths)
             ref_K = all_dict['K'][:, ref_all_dict_idx, ]
