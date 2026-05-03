@@ -9,7 +9,7 @@ python -m scripts.trainer \
     --cfg_path configs/nuscenes/recondrive.yaml \
     --lora_ckpt /home/jinheng.li/project/FeedforwardGS-RD/ReconDrive/checkpoints/lora_converted_4to24.pt \
     --devices 8 \
-    --ckpt_dir /train-syncdata/jinheng.li/project/DDSR/nucense/v1_5.1
+    --ckpt_dir /train-syncdata/jinheng.li/project/DDSR/nucense/v2_5.4
 
 # lora_converted.pt 生成方式（只需跑一次）：
 # python scripts/convert_lora_ckpt.py

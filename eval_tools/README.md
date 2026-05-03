@@ -18,6 +18,7 @@ ReconDrive 推理与高斯保存工具集。
 | `eval_tools/save_pointcloud_split.py` | CVG | 逐帧按相机分别保存点云，区分 frame i / frame i+6 坐标系 |
 | `eval_tools/save_pointcloud_cvg_gt.py` | CVG | 保存 CVG 数据集 LiDAR 真值点云，支持参考帧坐标系 |
 | `eval_tools/eval_pointcloud_cvg.py` | CVG | 批量评测点云重建质量（Acc / Comp / F1 / CD） |
+| `eval_tools/render_split.py` | CVG | 拆分 frame 0 / frame N 高斯，渲染 4 种交叉组合图像并保存 PLY |
 
 ---
 
@@ -28,15 +29,16 @@ ReconDrive 推理与高斯保存工具集。
 ```bash
 # NuScenes
 python scripts/inference.py \
-    --cfg_path configs/nuscenes/recondrive.yaml \
-    --restore_ckpt /train-syncdata/jinheng.li/project/DDSR/v1_4.27/ckpt/best_module.ckpt \
-    --output_dir /home/jinheng.li/project/DDSR/work_dirs/inference_results
+    --cfg_path /home/jinheng.li/project/DDSR/configs/nuscenes/recondrive.yaml \
+    --restore_ckpt  /train-syncdata/jinheng.li/project/DDSR/nucense/v1_5.1/best_module-v2.ckpt\
+    --output_dir work_dirs/inference_results
 
 # CVG（config 中 datamodule_type: cvg）
 python scripts/inference.py \
-    --cfg_path configs/cvg/recondrive_cvg_1cam.yaml \
+    --cfg_path configs/cvg/recondrive_cvg_3cam.yaml \
     --restore_ckpt checkpoints/recondrive_stage2.ckpt \
     --output_dir work_dirs/cvg_inference_results
+
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -61,8 +63,9 @@ CVG 场景渲染评测脚本，分别输出**重建帧**（frame 0）、**中间
 ```bash
 # 基础评测（只计算 test split 指标，不保存渲染图）
 python eval_tools/eval_rendering.py \
-    --cfg_path configs/cvg/recondrive_cvg_3cam.yaml \
-    --restore_ckpt work_dirs/cvg_cam3_training-v2/ckpt/best_module-v1.ckpt \
+    --cfg_path /home/jinheng.li/project/DDSR/configs/nuscenes/recondrive.yaml \
+    --restore_ckpt /train-syncdata/jinheng.li/project/DDSR/nucense/v1_5.1/best_module-v2.ckpt \
+    --output_dir work_dirs/inference_novel-view_results \
     --no_renders
 
 # 完整评测（保存所有帧的新视角渲染图 ）
@@ -70,7 +73,7 @@ python eval_tools/eval_rendering.py \
     --cfg_path configs/cvg/recondrive_cvg_3cam.yaml \
     --restore_ckpt work_dirs/cvg_cam3_training-v2/ckpt/best_module-v1.ckpt \
     --output_dir work_dirs/inference_novel-view_results \
-    --novel_distances 0.5,1.0,2.0 \
+    --novel_distances 1.0,2.0 \
     --split all
 
 # 只跑前 2 个场景做快速验证
@@ -123,6 +126,63 @@ python eval_tools/eval_rendering.py \
 
 ---
 
+## eval_tools/render_split.py
+
+CVG 场景**分帧高斯渲染**脚本。模型推理输出 frame 0 与 frame N（默认 frame 6）两组高斯，本脚本将两组高斯拆开，生成 4 种交叉组合渲染图，便于分析每帧高斯的质量与对齐情况。同时将两帧高斯分别保存为标准 3DGS PLY 文件。
+
+**每个 sample 每个相机输出 4 张渲染图：**
+
+| 文件名 | 高斯来源 | 相机来源 | 说明 |
+|--------|----------|----------|------|
+| `frame0_gs_on_frame0_cam_cam_{id}.png` | frame 0 | frame 0 | 重建参考帧自身渲染 |
+| `frameN_gs_on_frameN_cam_cam_{id}.png` | frame N | frame N | 另一重建帧自身渲染 |
+| `frame0_gs_on_frameN_cam_cam_{id}.png` | frame 0 | frame N | frame 0 高斯在 frame N 视角下渲染 |
+| `frameN_gs_on_frame0_cam_cam_{id}.png` | frame N | frame 0 | frame N 高斯在 frame 0 视角下渲染 |
+
+```bash
+python eval_tools/render_split.py \
+    --cfg_path configs/cvg/recondrive_cvg_3cam.yaml \
+    --restore_ckpt checkpoints/recondrive_stage2.ckpt \
+    --output_dir work_dirs/split_render_results
+
+# 只处理前 2 个场景（快速验证）
+python eval_tools/render_split.py \
+    --cfg_path configs/cvg/recondrive_cvg_3cam.yaml \
+    --restore_ckpt /train-syncdata/jinheng.li/project/DDS/v3_4.28/best_module-v1.ckpt \
+    --output_dir work_dirs/split_render_results \
+    --max_scenes 2
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--cfg_path` | 必填 | YAML 配置文件路径 |
+| `--restore_ckpt` | 必填 | 模型 checkpoint 路径 |
+| `--output_dir` | `<save_dir>/scene_inference_results` | 结果输出目录 |
+| `--device` | config 中 devices[0] | 运行设备，如 `cuda:0` |
+| `--max_scenes` | 全部 | 最多处理 N 个场景 |
+| `--no_renders` | false | 只跑推理，不保存渲染图和 PLY |
+| `--eval_resolution` | `original` | 渲染分辨率，如 `280x518` |
+
+> **注意：** 脚本内部硬编码 `max_samples=2`（每场景仅处理前 2 个 sample）、`frame_skip=6`（每 6 帧取一帧），主要用于快速分帧质量验证。
+
+**输出目录结构：**
+
+```
+<output_dir>/
+└── scene_xxx/
+    └── sample_0000/
+        ├── split_frames/
+        │   ├── 280x518_frame0_gs_on_frame0_cam_cam_0.png
+        │   ├── 280x518_frameN_gs_on_frameN_cam_cam_0.png
+        │   ├── 280x518_frame0_gs_on_frameN_cam_cam_0.png
+        │   └── 280x518_frameN_gs_on_frame0_cam_cam_0.png
+        └── gaussians/
+            ├── frame0_gaussians.ply
+            └── frameN_gaussians.ply
+```
+
+---
+
 ## eval_tools/render_to_video.py
 
 将 `eval_rendering.py` 输出的图像序列转为视频，并支持将多个视角合成为带文字标签的 grid 视频。
@@ -137,8 +197,8 @@ python eval_tools/render_to_video.py \
 
 # 单视角相机新视角视频合成
 python eval_tools/render_to_video.py \
-    --input-dir work_dirs/inference_novel-view_results/scene_004 \
-    --output-dir work_dirs/videos/scene_004 \
+    --input-dir work_dirs/inference_novel-view_results/scene-0103 \
+    --output-dir work_dirs/videos/scene_0103 \
     --fps 20 --cams 0 \
     --layout "left_1.0m,gt_views_gt,right_1.0m;left_2.0m,gt_views_pred,right_2.0m" \
     --labels "left 1m,GT,right 1m;left 2m,render,right 2m"
@@ -146,9 +206,9 @@ python eval_tools/render_to_video.py \
 
 # 3视角相机视频合成（行=view类型，列=相机，一条命令生成 3 相机宽幅视频）
 python eval_tools/render_to_video.py \
-    --input-dir work_dirs/inference_novel-view_results/scene_004 \
-    --output-dir work_dirs/videos/scene_004 \
-    --fps 20 --cams 0,1,2 \
+    --input-dir work_dirs/inference_novel-view_results/scene-0103 \
+    --output-dir work_dirs/videos/scene_0103 \
+    --fps 20 --cams 0 \
     --layout "gt_views_gt;gt_views_pred" \
     --labels "GT;Rendered" \
     --cam-per-col

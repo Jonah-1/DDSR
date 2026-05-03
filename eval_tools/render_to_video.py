@@ -273,11 +273,17 @@ def compose_grid(video_map: dict, grid: list, labels: list,
         parts = "".join(f"[cell{input_idx[(r, c)]}]" for c in cols_in_row)
         label = f"r{r}"
         row_labels.append(label)
-        filters.append(f"{parts}hstack=inputs={len(cols_in_row)}[{label}]")
+        if len(cols_in_row) == 1:
+            filters.append(f"{parts}copy[{label}]")
+        else:
+            filters.append(f"{parts}hstack=inputs={len(cols_in_row)}[{label}]")
 
     # vstack all rows
     parts = "".join(f"[{l}]" for l in row_labels)
-    filters.append(f"{parts}vstack=inputs={n_rows}[out]")
+    if len(row_labels) == 1:
+        filters.append(f"{parts}copy[out]")
+    else:
+        filters.append(f"{parts}vstack=inputs={n_rows}[out]")
 
     cmd.extend([
         "-filter_complex", ";".join(filters),

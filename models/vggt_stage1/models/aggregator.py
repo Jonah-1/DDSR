@@ -223,7 +223,7 @@ class Aggregator(nn.Module):
                 for _ in range(num_mask_layers)
             ]
         )
-        # Single DA applied to dynamic tokens after the num_mask_layers layers of Path 2
+        # Single DA applied to edge/boundary tokens after the num_mask_layers layers of Path 2
         self.path2_da = DeformableTokenAttention(
             dim=embed_dim,
             num_heads=num_heads,
@@ -328,10 +328,11 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
-        # Compute patch-level key mask (Path 1: K zeroing for dynamic tokens)
+        # Compute patch-level masks (Path 1: K zeroing for dynamic tokens)
         patch_key_mask = None
+        patch_partial_mask = None
         if dynamic_mask is not None:
-            patch_key_mask = self._compute_patch_key_mask(dynamic_mask, B, S, H, W, images.device)
+            patch_key_mask, patch_partial_mask = self._compute_patch_key_mask(dynamic_mask, B, S, H, W, images.device)
 
         # Path 2 starts from the same token state as Path 1
         tokens_p2 = tokens.clone() if (patch_key_mask is not None and self.num_mask_layers > 0) else None
@@ -365,13 +366,17 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            # After the last dual-path iteration, apply DA to dynamic tokens in path2, then fuse
+            # After the last dual-path iteration, apply DA then fuse
             if use_dual and iter_idx == self.num_mask_layers - 1:
-                # Ensure tokens_p2 is in [B*S, P, C] for DA
+                # Ensure both token streams are in [B*S, P, C]
+                if tokens.shape != (B * S, P, C):
+                    tokens = tokens.view(B, S, P, C).view(B * S, P, C)
                 if tokens_p2.shape != (B * S, P, C):
                     tokens_p2 = tokens_p2.view(B, S, P, C).view(B * S, P, C)
-                tokens_p2 = self.path2_da(tokens_p2, patch_key_mask, self.patch_start_idx, H_p, W_p)
-                tokens = self._fuse_dynamic_tokens(tokens, tokens_p2, patch_key_mask, B, S, P, C)
+                # Path 1 DA: not applied
+                # Path 2 DA: edge/boundary tokens only
+                tokens_p2 = self.path2_da(tokens_p2, patch_partial_mask, self.patch_start_idx, H_p, W_p)
+                tokens = self._fuse_dynamic_tokens(tokens, tokens_p2, patch_partial_mask, B, S, P, C)
                 tokens_p2 = None  # free memory; path2 is done
 
             for i in range(len(frame_intermediates)):
@@ -385,23 +390,29 @@ class Aggregator(nn.Module):
 
     def _compute_patch_key_mask(
         self, dynamic_mask: torch.Tensor, B: int, S: int, H: int, W: int, device: torch.device
-    ) -> torch.Tensor:
+    ):
         """
-        Downsample pixel-level dynamic_mask to patch-level and prepend False for special tokens.
+        Downsample pixel-level dynamic_mask to patch-level.
 
-        Args:
-            dynamic_mask: [B, S, H, W] binary float/bool, 1 = dynamic pixel
         Returns:
-            patch_key_mask: [B*S, patch_start_idx + Ph*Pw] bool, True = dynamic token
+            key_mask:     [B*S, P] bool – any pixel dynamic  (for Path-1 K-zeroing & fusion)
+            partial_mask: [B*S, P] bool – boundary token (some but not all pixels dynamic,
+                          used for Path-1 DA)
         """
         mask_flat = dynamic_mask.float().view(B * S, 1, H, W)
-        # Max pool: any dynamic pixel in a patch makes the whole patch dynamic
-        mask_patch = F.max_pool2d(mask_flat, kernel_size=self.patch_size, stride=self.patch_size)
+        # max_pool: patch dynamic if ANY pixel is dynamic
+        max_patch = F.max_pool2d(mask_flat, kernel_size=self.patch_size, stride=self.patch_size)
+        # avg_pool: fraction of dynamic pixels per patch
+        avg_patch = F.avg_pool2d(mask_flat, kernel_size=self.patch_size, stride=self.patch_size)
         Ph, Pw = H // self.patch_size, W // self.patch_size
-        mask_patch = mask_patch.squeeze(1).view(B * S, Ph * Pw).bool()
-        # Camera and register tokens are never masked
-        special_false = torch.zeros(B * S, self.patch_start_idx, dtype=torch.bool, device=device)
-        return torch.cat([special_false, mask_patch], dim=1)  # [B*S, P]
+        any_dyn  = max_patch.squeeze(1).view(B * S, Ph * Pw).bool()
+        full_dyn = avg_patch.squeeze(1).view(B * S, Ph * Pw) >= (1.0 - 1e-6)
+        # boundary: has some dynamic pixels but not completely covered
+        partial  = any_dyn & ~full_dyn
+        special  = torch.zeros(B * S, self.patch_start_idx, dtype=torch.bool, device=device)
+        key_mask     = torch.cat([special, any_dyn], dim=1)
+        partial_mask = torch.cat([special, partial],  dim=1)
+        return key_mask, partial_mask
 
     def _process_path2_frame_attention(
         self, tokens, B, S, P, C, p2_frame_idx, pos=None, **kwargs

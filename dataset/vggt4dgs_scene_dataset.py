@@ -765,7 +765,7 @@ class NuScenesdataset4D(Dataset):
                     scene_token=scene_token,
                     scene_name=scene_name,
                     scene_idx=scene_idx,
-                    is_key_frame=False
+                    is_key_frame=True,
                 )
                 intermediate_dict = align_dataset(intermediate_dict)
                 target_dict_list.append(intermediate_dict)
@@ -790,12 +790,15 @@ class NuScenesdataset4D(Dataset):
             context_dict_list.append(context_dict)
         
         if target_dict_list:
+            # Pop vehicle_annotations before collate to avoid size mismatch (different vehicles per frame)
+            vehicle_anns_intermediate = [t.pop('vehicle_annotations', None) for t in target_dict_list]
             target_dict = default_collate(target_dict_list)
             for k, v in target_dict.items():
                 if isinstance(v, torch.Tensor) and len(v.shape) >= 2:
                     target_dict[k] = torch.cat([d for d in v], dim=0)
         else:
             target_dict = {}
+            vehicle_anns_intermediate = []
 
         if context_dict_list:
             # Extract vehicle annotations from both context frames
@@ -882,6 +885,13 @@ class NuScenesdataset4D(Dataset):
             if vehicle_anns_frame_context_span and vehicle_anns_frame_context_span[0] is not None:
                 all_dict[f'vehicle_annotations_frame_{self.context_span}'] = vehicle_anns_frame_context_span[0]
                 all_context_dict[f'vehicle_annotations_frame_{self.context_span}'] = vehicle_anns_frame_context_span[0]
+
+            # Store intermediate frame vehicle annotations with frame-specific keys
+            for i, anns in enumerate(vehicle_anns_intermediate):
+                if anns is not None:
+                    key = f'vehicle_annotations_frame_{i + 1}'
+                    all_dict[key] = anns
+                    all_context_dict[key] = anns
 
             # Also keep combined annotations for backward compatibility (optional)
             combined_vehicle_anns = []

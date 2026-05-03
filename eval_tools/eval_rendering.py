@@ -21,16 +21,20 @@ import time
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
+import math
 import torch.nn.functional as F
 from gsplat.rendering import rasterization
+import pandas as pd
+from skimage.metrics import structural_similarity
 
 project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root))
-sys.path.append(str(project_root / "models"))  # Add models directory for vggt imports
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / "models"))  # Add models directory for vggt imports
 
 from dataset.vggt3dgs_scene_data_module import VGGT3DGS_SceneDataModule
 from dataset.vggt4dgs_scene_dataset import custom_collate_fn
 from models.recondrive_model import ReconDrive_LITModelModule
+from models.loss_util import compute_masked_loss
 
 
 class SceneSampleDataset(Dataset):
@@ -88,7 +92,7 @@ def load_model_from_checkpoint(checkpoint_path, model_cfg, device):
 def run_inference(model_cfg=None, model=None, checkpoint_path=None,
                   scene_dataloader=None, device='cuda:0',
                   save_results=True, output_dir=None, novel_distances=[1.0, 2.0],
-                  eval_resolution='280x518'):
+                  eval_resolution='280x518', datamodule_type='vggt4dgs'):
     """
     Scene-based inference function for single GPU
 
@@ -112,7 +116,7 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
             raise ValueError("model_cfg and checkpoint_path required when model is None")
         model = load_model_from_checkpoint(checkpoint_path, model_cfg, device)
 
-    return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution)
+    return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution, datamodule_type)
 
 
 def save_rendered_image(tensor_img, save_path, upsample_to=None):
@@ -224,12 +228,37 @@ def render_novel_views(model, recontrast_data, render_data, device, scene_name, 
                 resize_height, resize_width = eval_resolution.split('x')
                 resize_height = int(resize_height)
                 resize_width = int(resize_width)
-                if resize_height !=model_height or resize_width != model_width:
+                if resize_height != model_height or resize_width != model_width:
                     save_rendered_image(render_rgb, save_path, upsample_to=(resize_height, resize_width))
-                else:  # eval_resolution == 'original'
+                else:
                     save_rendered_image(render_rgb, save_path)
+                saved_paths.append(save_path)
         
     return saved_paths
+
+def _compute_masked_metrics(model, pred_eval, gt_eval, batch_splating_data, frame_id, cam_id):
+    """Compute PSNR/SSIM/LPIPS excluding dynamic pixels."""
+    dyn = batch_splating_data.get(('dynamic_mask', frame_id, cam_id), None)
+    if dyn is None:
+        return (model.compute_psnr(gt_eval, pred_eval).mean().item(),
+                model.compute_ssim(gt_eval, pred_eval).mean().item(),
+                model.compute_lpips(gt_eval, pred_eval).mean().item())
+    dyn = dyn[0:1].float()
+    if dyn.shape[-2:] != pred_eval.shape[-2:]:
+        dyn = F.interpolate(dyn, size=pred_eval.shape[-2:], mode='nearest')
+    static_mask = 1.0 - dyn  # 1=static
+    sq_err = (pred_eval.clamp(0, 1) - gt_eval.clamp(0, 1)) ** 2
+    mse = compute_masked_loss(sq_err, static_mask, eps=0)
+    psnr_val = -10 * math.log10(mse.item() + 1e-10)
+    static_np = static_mask[0, 0].cpu().numpy()
+    _, ssim_map = structural_similarity(
+        gt_eval[0].detach().cpu().numpy(), pred_eval[0].detach().cpu().numpy(),
+        win_size=11, gaussian_weights=True, channel_axis=0, data_range=1.0, full=True)
+    ssim_hw = ssim_map.mean(0)
+    ssim_val = float((ssim_hw * static_np).sum() / max(static_np.sum(), 1e-8))
+    lpips_map = model.lpips(pred_eval, gt_eval, normalize=True)
+    lpips_val = float(compute_masked_loss(lpips_map, static_mask, eps=0).item())
+    return psnr_val, ssim_val, lpips_val
 
 def to_device(data, device):
     if isinstance(data, dict):
@@ -258,7 +287,7 @@ def _extract_scene_idx(scene_batch, default_idx=0):
             return _extract_first_value(scene_batch[key]['scene_idx'], default_idx)
     return default_idx
 
-def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0):
+def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0, datamodule_type='vggt4dgs'):
     """Process a single scene batch and return results"""
     scene_start_time = time.time()
 
@@ -326,9 +355,14 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
     all_novel_psnr, all_novel_ssim, all_novel_lpips = [], [], []
     batch_count = 0
 
+    model_width = getattr(model, 'width', 518)
+    model_height = getattr(model, 'height', 280)
+    if eval_resolution == 'original':
+        eval_resolution = f'{model_height}x{model_width}'
+
     for batch_data in scene_loader:
         batch_count += 1
-        
+
         # Get the actual sample index from the original data
         if original_sample_indices is not None:
             if batch_count - 1 < len(original_sample_indices):
@@ -345,201 +379,166 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
         # Run prediction
         output = model.predict_step(batch_data, batch_idx)
 
-        model_width = getattr(model, 'width', 518)
-        model_height = getattr(model, 'height', 280)
+        batch_recontrast_data, batch_render_data, batch_splating_data = output
 
+        batch_recon_psnr, batch_recon_ssim, batch_recon_lpips = [], [], []
+        batch_novel_psnr, batch_novel_ssim, batch_novel_lpips = [], [], []
 
-        if isinstance(output, tuple):
-            batch_recontrast_data, batch_render_data, batch_splating_data = output
-            
-            # Calculate metrics for this batch
-            batch_psnr, batch_ssim, batch_lpips = [], [], []
+        # Determine which frames are available from the returned data
+        available_frames = set()
+        for key in batch_splating_data.keys():
+            if isinstance(key, tuple) and key[0] == 'gaussian_color':
+                available_frames.add(key[1])  # frame_id is at index 1
+        available_frames = sorted(list(available_frames))
 
-            # Separate metrics for reconstruction and novel view modes
-            recon_psnr, recon_ssim, recon_lpips = [], [], []
-            novel_psnr, novel_ssim, novel_lpips = [], [], []
+        print(f"GPU {gpu_id}: Available frames for evaluation: {available_frames}")
 
-            # Use the batch index as the global sample index
-
-
-            # Determine which frames are available from the returned data
-            available_frames = set()
-            for key in batch_splating_data.keys():
-                if isinstance(key, tuple) and key[0] == 'gaussian_color':
-                    available_frames.add(key[1])  # frame_id is at index 1
-            available_frames = sorted(list(available_frames))
-
-            print(f"GPU {gpu_id}: Available frames for evaluation: {available_frames}")
-
-            # === Mode 1: Scene Reconstruction (frame 0) ===
-            frame_id = 0
-            if frame_id in [0]:
-                for cam_id in range(num_cams):
-                    pred_key = ('gaussian_color', frame_id, cam_id)
-                    gt_key = ('groudtruth', frame_id, cam_id)
-                    if pred_key in batch_splating_data and gt_key in batch_splating_data:
-                        pred = batch_splating_data[pred_key][0:1]
-                        gt = batch_splating_data[gt_key][0:1]
-                        # import pdb;pdb.set_trace()
-                        eval_resolution='280x518'
-                        resize_height, resize_width = eval_resolution.split('x')
-                        resize_height = int(resize_height)
-                        resize_width = int(resize_width)
-                        if (resize_height == model_height) and (resize_width == model_width):
-                            pred_eval = pred.clamp(0, 1)
-                            gt_eval = gt.clamp(0, 1)
+        # === Mode 1: Scene Reconstruction (frame 0) ===
+        frame_id = 0
+        if frame_id in [0]:
+            for cam_id in range(num_cams):
+                pred_key = ('gaussian_color', frame_id, cam_id)
+                gt_key = ('groudtruth', frame_id, cam_id)
+                if pred_key in batch_splating_data and gt_key in batch_splating_data:
+                    pred = batch_splating_data[pred_key][0:1]
+                    gt = batch_splating_data[gt_key][0:1]
+                    resize_height, resize_width = eval_resolution.split('x')
+                    resize_height = int(resize_height)
+                    resize_width = int(resize_width)
+                    if (resize_height == model_height) and (resize_width == model_width):
+                        pred_eval = pred.clamp(0, 1)
+                        gt_eval = gt.clamp(0, 1)
+                    else:
+                        if ('color_org', frame_id) in scene_batch:
+                            gt_original = scene_batch[('color_org', frame_id)][:, cam_id, ...][0:1]
+                            gt_original = gt_original.clamp(0, 1).to(pred.device)
+                            gt_eval = F.interpolate(gt_original, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
                         else:
-                            if ('color_org', frame_id) in scene_batch:
-                                gt_original = scene_batch[('color_org', frame_id)][:, cam_id, ...][0:1]
-                                gt_original = gt_original.clamp(0, 1).to(pred.device)
-                                gt_eval = F.interpolate(gt_original, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
-                            else:
-                                gt_eval = F.interpolate(gt, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
-                                gt_eval = gt_eval.clamp(0, 1)
-                            pred_eval = F.interpolate(pred, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
-                            pred_eval = pred_eval.clamp(0, 1)
+                            gt_eval = F.interpolate(gt, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
+                            gt_eval = gt_eval.clamp(0, 1)
+                        pred_eval = F.interpolate(pred, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
+                        pred_eval = pred_eval.clamp(0, 1)
 
-                        psnr_val = model.compute_psnr(gt_eval, pred_eval).mean().item()
-                        ssim_val = model.compute_ssim(gt_eval, pred_eval).mean().item()
-                        lpips_val = model.compute_lpips(gt_eval, pred_eval).mean().item()
+                    psnr_val, ssim_val, lpips_val = _compute_masked_metrics(
+                        model, pred_eval, gt_eval, batch_splating_data, frame_id, cam_id)
 
-                        recon_psnr.append(psnr_val)
-                        recon_ssim.append(ssim_val)
-                        recon_lpips.append(lpips_val)
+                    batch_recon_psnr.append(psnr_val)
+                    batch_recon_ssim.append(ssim_val)
+                    batch_recon_lpips.append(lpips_val)
 
-                        if output_dir:
-                            global_sample_idx = actual_sample_idx + frame_id
-                            frame_dir = 'gt_views'
-                            pred_save_path = os.path.join(output_dir, scene_name,
-                                                        f'sample_{global_sample_idx:04d}', frame_dir,  f'{eval_resolution}_cam_{cam_id}_pred.png')
-                            gt_save_path = os.path.join(output_dir, scene_name,
-                                                        f'sample_{global_sample_idx:04d}', frame_dir,  f'{eval_resolution}_cam_{cam_id}_gt.png')
-                            os.makedirs(os.path.dirname(pred_save_path), exist_ok=True)
-                            # Replace hood region with GT pixels for cleaner visualization
-                            pred_to_save = pred_eval
-                            if ('context_frames' in batch_data and
-                                    'hoodline_masks' in batch_data['context_frames']):
-                                hm = batch_data['context_frames']['hoodline_masks']  # (1, 2*num_cams, 1, H, W)
-                                if cam_id < hm.shape[1]:
-                                    hood_mask = hm[0, cam_id, 0].to(pred_eval.device)  # (H, W)
-                                    hood_mask = hood_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-                                    if hood_mask.shape[-2:] != pred_eval.shape[-2:]:
-                                        hood_mask = F.interpolate(hood_mask, size=pred_eval.shape[-2:], mode='nearest')
-                                    pred_to_save = pred_eval * (1 - hood_mask) + gt_eval * hood_mask
-                            save_rendered_image(pred_to_save.squeeze(0), pred_save_path)
-                            save_rendered_image(gt_eval.squeeze(0), gt_save_path)
+                    if output_dir:
+                        global_sample_idx = actual_sample_idx + frame_id
+                        frame_dir = 'gt_views'
+                        pred_save_path = os.path.join(output_dir, scene_name,
+                                                    f'sample_{global_sample_idx:04d}', frame_dir, f'{eval_resolution}_cam_{cam_id}_pred.png')
+                        gt_save_path = os.path.join(output_dir, scene_name,
+                                                    f'sample_{global_sample_idx:04d}', frame_dir, f'{eval_resolution}_cam_{cam_id}_gt.png')
+                        os.makedirs(os.path.dirname(pred_save_path), exist_ok=True)
+                        pred_to_save = pred_eval
+                        if ('context_frames' in batch_data and
+                                'hoodline_masks' in batch_data['context_frames']):
+                            hm = batch_data['context_frames']['hoodline_masks']
+                            if cam_id < hm.shape[1]:
+                                hood_mask = hm[0, cam_id, 0].to(pred_eval.device)
+                                hood_mask = hood_mask.unsqueeze(0).unsqueeze(0)
+                                if hood_mask.shape[-2:] != pred_eval.shape[-2:]:
+                                    hood_mask = F.interpolate(hood_mask, size=pred_eval.shape[-2:], mode='nearest')
+                                pred_to_save = pred_eval * (1 - hood_mask) + gt_eval * hood_mask
+                        save_rendered_image(pred_to_save.squeeze(0), pred_save_path)
+                        save_rendered_image(gt_eval.squeeze(0), gt_save_path)
 
-            # === Mode 2: Novel View Synthesis (middle frames) ===
-            novel_frames = [f for f in available_frames if f != 0]
-            for frame_id in novel_frames:
-                for cam_id in range(num_cams):
-                    pred_key = ('gaussian_color', frame_id, cam_id)
-                    gt_key = ('groudtruth', frame_id, cam_id)
-                    if pred_key in batch_splating_data and gt_key in batch_splating_data:
-                        pred = batch_splating_data[pred_key][0:1]
-                        gt = batch_splating_data[gt_key][0:1]
+        # === Mode 2: Novel View Synthesis (middle frames) ===
+        novel_frames = [f for f in available_frames if f != 0]
+        for frame_id in novel_frames:
+            for cam_id in range(num_cams):
+                pred_key = ('gaussian_color', frame_id, cam_id)
+                gt_key = ('groudtruth', frame_id, cam_id)
+                if pred_key in batch_splating_data and gt_key in batch_splating_data:
+                    pred = batch_splating_data[pred_key][0:1]
+                    gt = batch_splating_data[gt_key][0:1]
 
-                        resize_height, resize_width = eval_resolution.split('x')
-                        resize_height = int(resize_height)
-                        resize_width = int(resize_width)
-                        if (resize_height == model_height) and (resize_width == model_width):
-                            # Original mode: Use original model resolution (280x518)
-                            if frame_id == 0 and cam_id == 0:
-                                print(f"GPU {gpu_id}: Original mode - Using model resolution: pred={pred.shape}, gt={gt.shape}")
-                                print(f"GPU {gpu_id}: Original mode - pred range: [{pred.min():.3f}, {pred.max():.3f}], gt range: [{gt.min():.3f}, {gt.max():.3f}]")
-                            
-                            # Ensure both pred and gt are in [0,1] range
-                            pred_eval = pred.clamp(0, 1)
-                            gt_eval = gt.clamp(0, 1)
+                    resize_height, resize_width = eval_resolution.split('x')
+                    resize_height = int(resize_height)
+                    resize_width = int(resize_width)
+                    if (resize_height == model_height) and (resize_width == model_width):
+                        pred_eval = pred.clamp(0, 1)
+                        gt_eval = gt.clamp(0, 1)
+                    else:
+                        if ('color_org', frame_id) in scene_batch:
+                            gt_original = scene_batch[('color_org', frame_id)][:, cam_id, ...][0:1]
+                            gt_original = gt_original.clamp(0, 1).to(pred.device)
+                            gt_eval = F.interpolate(gt_original, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
                         else:
-                            if ('color_org', frame_id) in scene_batch:
-                                # Use original high-resolution GT and upsample to 900x1600
-                                gt_original = scene_batch[('color_org', frame_id)][:, cam_id, ...][0:1]
-                                if frame_id == 0 and cam_id == 0:
-                                    print(f"GPU {gpu_id}: Upsampled mode - Original GT shape: {gt_original.shape}")
-                                    print(f"GPU {gpu_id}: Upsampled mode - Original GT range: [{gt_original.min():.3f}, {gt_original.max():.3f}]")
-                                
-                                # Ensure GT is in [0,1] range and on correct device
-                                gt_original = gt_original.clamp(0, 1).to(pred.device)
-                                gt_eval = F.interpolate(gt_original, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
-                            else:
-                                # Fallback: use downsampled GT if original not available
-                                if frame_id == 0 and cam_id == 0:
-                                    print(f"GPU {gpu_id}: Upsampled mode - Warning: Using downsampled GT: {gt.shape}")
-                                gt_eval = F.interpolate(gt, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
-                                gt_eval = gt_eval.clamp(0, 1)
-                            
-                            # Upsample predicted image to 900x1600 and ensure in [0,1] range
-                            pred_eval = F.interpolate(pred, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
-                            pred_eval = pred_eval.clamp(0, 1)
+                            gt_eval = F.interpolate(gt, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
+                            gt_eval = gt_eval.clamp(0, 1)
+                        pred_eval = F.interpolate(pred, size=(resize_height, resize_width), mode='bilinear', align_corners=False)
+                        pred_eval = pred_eval.clamp(0, 1)
 
-                        # Calculate novel view metrics
-                        psnr_val = model.compute_psnr(gt_eval, pred_eval).mean().item()
-                        ssim_val = model.compute_ssim(gt_eval, pred_eval).mean().item()
-                        lpips_val = model.compute_lpips(gt_eval, pred_eval).mean().item()
+                    # Calculate novel view metrics
+                    psnr_val, ssim_val, lpips_val = _compute_masked_metrics(
+                        model, pred_eval, gt_eval, batch_splating_data, frame_id, cam_id)
 
-                        novel_psnr.append(psnr_val)
-                        novel_ssim.append(ssim_val)
-                        novel_lpips.append(lpips_val)
+                    batch_novel_psnr.append(psnr_val)
+                    batch_novel_ssim.append(ssim_val)
+                    batch_novel_lpips.append(lpips_val)
 
-                        # Save novel view images
-                        if output_dir:
-                            global_sample_idx = actual_sample_idx + frame_id
-                            frame_dir = f'gt_views'
-                            pred_save_path = os.path.join(output_dir, scene_name,
-                                                        f'sample_{global_sample_idx:04d}', frame_dir,  f'{eval_resolution}_cam_{cam_id}_pred.png')
-                            gt_save_path = os.path.join(output_dir, scene_name,
-                                                        f'sample_{global_sample_idx:04d}', frame_dir,  f'{eval_resolution}_cam_{cam_id}_gt.png')
-                            os.makedirs(os.path.dirname(pred_save_path), exist_ok=True)
-                            # Replace hood region with frame 0 GT pixels
-                            pred_to_save = pred_eval
-                            if ('context_frames' in batch_data and
-                                    'hoodline_masks' in batch_data['context_frames']):
-                                hm = batch_data['context_frames']['hoodline_masks']
-                                if cam_id < hm.shape[1]:
-                                    hood_mask = hm[0, cam_id, 0].to(pred_eval.device)
-                                    hood_mask = hood_mask.unsqueeze(0).unsqueeze(0)
-                                    if hood_mask.shape[-2:] != pred_eval.shape[-2:]:
-                                        hood_mask = F.interpolate(hood_mask, size=pred_eval.shape[-2:], mode='nearest')
-                                    # Use frame 0 GT as the fill source
-                                    gt0 = batch_splating_data[('groudtruth', 0, cam_id)][0:1].clamp(0, 1)
-                                    if gt0.shape[-2:] != pred_eval.shape[-2:]:
-                                        gt0 = F.interpolate(gt0, size=pred_eval.shape[-2:], mode='bilinear', align_corners=False)
-                                    pred_to_save = pred_eval * (1 - hood_mask) + gt0 * hood_mask
-                            save_rendered_image(pred_to_save.squeeze(0), pred_save_path)
-                            save_rendered_image(gt_eval.squeeze(0), gt_save_path)
+                    # Save novel view images
+                    if output_dir:
+                        global_sample_idx = actual_sample_idx + frame_id
+                        frame_dir = f'gt_views'
+                        pred_save_path = os.path.join(output_dir, scene_name,
+                                                    f'sample_{global_sample_idx:04d}', frame_dir,  f'{eval_resolution}_cam_{cam_id}_pred.png')
+                        gt_save_path = os.path.join(output_dir, scene_name,
+                                                    f'sample_{global_sample_idx:04d}', frame_dir,  f'{eval_resolution}_cam_{cam_id}_gt.png')
+                        os.makedirs(os.path.dirname(pred_save_path), exist_ok=True)
+                        # Replace hood region with frame 0 GT pixels
+                        pred_to_save = pred_eval
+                        if ('context_frames' in batch_data and
+                                'hoodline_masks' in batch_data['context_frames']):
+                            hm = batch_data['context_frames']['hoodline_masks']
+                            if cam_id < hm.shape[1]:
+                                hood_mask = hm[0, cam_id, 0].to(pred_eval.device)
+                                hood_mask = hood_mask.unsqueeze(0).unsqueeze(0)
+                                if hood_mask.shape[-2:] != pred_eval.shape[-2:]:
+                                    hood_mask = F.interpolate(hood_mask, size=pred_eval.shape[-2:], mode='nearest')
+                                # Use frame 0 GT as the fill source
+                                gt0 = batch_splating_data[('groudtruth', 0, cam_id)][0:1].clamp(0, 1)
+                                if gt0.shape[-2:] != pred_eval.shape[-2:]:
+                                    gt0 = F.interpolate(gt0, size=pred_eval.shape[-2:], mode='bilinear', align_corners=False)
+                                pred_to_save = pred_eval * (1 - hood_mask) + gt0 * hood_mask
+                        save_rendered_image(pred_to_save.squeeze(0), pred_save_path)
+                        save_rendered_image(gt_eval.squeeze(0), gt_save_path)
 
-            # Print separate metrics for both modes
-            if recon_psnr:
-                print(f"GPU {gpu_id}: Recon metrics - PSNR: {np.mean(recon_psnr):.3f}, SSIM: {np.mean(recon_ssim):.3f}, LPIPS: {np.mean(recon_lpips):.3f}")
-            if novel_psnr:
-                print(f"GPU {gpu_id}: Novel metrics - PSNR: {np.mean(novel_psnr):.3f}, SSIM: {np.mean(novel_ssim):.3f}, LPIPS: {np.mean(novel_lpips):.3f}")
+        # Print separate metrics for both modes
+        if batch_recon_psnr:
+            print(f"GPU {gpu_id}: Recon metrics - PSNR: {np.mean(batch_recon_psnr):.3f}, SSIM: {np.mean(batch_recon_ssim):.3f}, LPIPS: {np.mean(batch_recon_lpips):.3f}")
+        if batch_novel_psnr:
+            print(f"GPU {gpu_id}: Novel metrics - PSNR: {np.mean(batch_novel_psnr):.3f}, SSIM: {np.mean(batch_novel_ssim):.3f}, LPIPS: {np.mean(batch_novel_lpips):.3f}")
 
-            # Generate and save novel views for all samples
-            if save_renders and output_dir:
-                # Define which frames to render novel views for (use available frames by default)
-                novel_render_frames = [0,1,2,3,4,5]
-                hoodline_masks_for_novel = None
-                if 'context_frames' in batch_data and 'hoodline_masks' in batch_data['context_frames']:
-                    hoodline_masks_for_novel = batch_data['context_frames']['hoodline_masks']
-                novel_view_paths = render_novel_views(
-                    model, batch_recontrast_data, batch_render_data,
-                    device, scene_name, 0, output_dir, actual_sample_idx, novel_distances, eval_resolution, novel_render_frames,
-                    hoodline_masks=hoodline_masks_for_novel,
-                )
-                print(f"GPU {gpu_id}: Saved novel views for sample {actual_sample_idx}: {len(novel_view_paths)} images")
+        # Generate and save novel views for all samples
+        if save_renders and output_dir:
+            novel_render_frames = [0,1,2,3,4,5]
+            hoodline_masks_for_novel = None
+            if 'context_frames' in batch_data and 'hoodline_masks' in batch_data['context_frames']:
+                hoodline_masks_for_novel = batch_data['context_frames']['hoodline_masks']
+            novel_view_paths = render_novel_views(
+                model, batch_recontrast_data, batch_render_data,
+                device, scene_name, 0, output_dir, actual_sample_idx, novel_distances, eval_resolution, novel_render_frames,
+                hoodline_masks=hoodline_masks_for_novel,
+            )
+            print(f"GPU {gpu_id}: Saved novel views for sample {actual_sample_idx}: {len(novel_view_paths)} images")
 
-            # Aggregate scene-level metrics (keep modes separate)
-            scene_psnr_list.extend(recon_psnr + novel_psnr)
-            scene_ssim_list.extend(recon_ssim + novel_ssim)
-            scene_lpips_list.extend(recon_lpips + novel_lpips)
-            all_recon_psnr.extend(recon_psnr)
-            all_recon_ssim.extend(recon_ssim)
-            all_recon_lpips.extend(recon_lpips)
-            all_novel_psnr.extend(novel_psnr)
-            all_novel_ssim.extend(novel_ssim)
-            all_novel_lpips.extend(novel_lpips)
-            
+        # Aggregate scene-level metrics
+        scene_psnr_list.extend(batch_recon_psnr + batch_novel_psnr)
+        scene_ssim_list.extend(batch_recon_ssim + batch_novel_ssim)
+        scene_lpips_list.extend(batch_recon_lpips + batch_novel_lpips)
+        all_recon_psnr.extend(batch_recon_psnr)
+        all_recon_ssim.extend(batch_recon_ssim)
+        all_recon_lpips.extend(batch_recon_lpips)
+        all_novel_psnr.extend(batch_novel_psnr)
+        all_novel_ssim.extend(batch_novel_ssim)
+        all_novel_lpips.extend(batch_novel_lpips)
+
 
     # Calculate processing time
     scene_processing_time = time.time() - scene_start_time
@@ -579,7 +578,7 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
     }
 
 
-def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518'):
+def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', datamodule_type='vggt4dgs'):
     """Run inference on all scenes - simplified using unified scene processing"""
     print(f"\nStarting scene-based inference on device: {device}")
     print(f"Number of scenes: {len(scene_dataloader)}")
@@ -597,7 +596,7 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
             result = _process_scene_batch(model, scene_batch, device, gpu_id=0,
                                         save_renders=save_results, output_dir=output_dir,
                                         novel_distances=novel_distances, eval_resolution=eval_resolution,
-                                        batch_idx=scene_idx)
+                                        batch_idx=scene_idx, datamodule_type=datamodule_type)
 
             all_scene_results.append(result)
             overall_psnr.extend(result['sample_metrics']['psnr_list'])
@@ -753,10 +752,12 @@ def main():
     parser.add_argument('--device', type=str, default=None, help='Device to use (e.g., cuda:0)')
 
     parser.add_argument('--no_renders', action='store_true', help='Disable saving rendered images and novel views')
-    parser.add_argument('--novel_distances', type=str, default='0.5,1.0,2.0,3.0',
+    parser.add_argument('--novel_distances', type=str, default='0.5,1.0,2.0',
                        help='Novel view translation distances in meters (comma-separated, e.g., "0.5,1.0,2.0,3.0")')
-    parser.add_argument('--eval_resolution', type=str, default='original',
+    parser.add_argument('--eval_resolution', type=str, default='original',# choices=['original', 'upsampled'],
                        help='Evaluation resolution mode: "original" for 280x518, "upsampled" for 900x1600')
+    parser.add_argument('--split', type=str, default='test',
+                       help='Dataset split to evaluate: train / val / test / all (default: test)')
 
     args = parser.parse_args()
     
@@ -816,10 +817,11 @@ def main():
     print(f"Override batch_size to: {config['data_cfg']['batch_size']}")
 
     # Initialize scene-based data module
-    print("Initializing nuScenes scene-based data module...")
-    data_module = VGGT3DGS_SceneDataModule(cfg=config['data_cfg'])
-
-    # data_module = VGGT3DGS_SceneDataModule(cfg=config['data_cfg'])
+    print("Initializing scene-based data module...")
+    print(f"Loading VGGT3DGS data module...")
+    data_module = VGGT3DGS_SceneDataModule(
+        cfg=config['data_cfg'],
+    )
     data_module.setup(stage='test')
     
     # Get scene dataloader

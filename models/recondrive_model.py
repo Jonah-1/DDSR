@@ -192,15 +192,15 @@ class ReconDriveModel(torch.nn.Module):
         """
         Trainable parameters:
           - depth_head, gs_head  (全部)
-          - aggregator.frame_blocks[11,17,23]  (仅 lora_* 权重)
-          - aggregator.global_blocks[11,17,23] (仅 lora_* 权重)
+          - aggregator.frame_blocks[3-23]  (仅 lora_* 权重，path1之后所有层)
+          - aggregator.global_blocks[3-23] (仅 lora_* 权重，path1之后所有层)
           - aggregator.path2_frame_blocks      (仅 lora_* 权重)
           - aggregator.path2_global_blocks     (仅 lora_* 权重)
           - aggregator.path2_da               (全部)
           - aggregator.dynamic_fusion_mlp     (全部)
         其余全部冻结。
         """
-        MAIN_LORA_INDICES = set(range(3, 24))  # layers 4-24 (1-indexed), i.e. all LoRA-capable layers
+        MAIN_LORA_INDICES = set(range(3, 24))  # path1之后所有层 (indices 3-23, 共21层)
 
         def _is_trainable(name: str) -> bool:
             if name.startswith('depth_head') or name.startswith('gs_head'):
@@ -233,7 +233,7 @@ class ReconDriveModel(torch.nn.Module):
         print(f"  Trainable: {trainable:,}  ({trainable/total*100:.2f}%)")
         print(f"  Trainable scope:")
         print(f"    depth_head, gs_head (all params)")
-        print(f"    frame_blocks / global_blocks [11,17,23] (lora only)")
+        print(f"    frame_blocks / global_blocks [3-23] (lora only, all post-path1 layers)")
         print(f"    path2_frame_blocks / path2_global_blocks (lora only)")
         print(f"    path2_da, dynamic_fusion_mlp (all params)")
 
@@ -301,7 +301,10 @@ class ReconDriveModel(torch.nn.Module):
             rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
             scale_maps = nn.functional.softplus(scale_maps,beta=1) * 0.01
             opacity_maps = nn.functional.sigmoid(opacity_maps)
-            
+
+            if dynamic_mask is not None:
+                opacity_maps = opacity_maps * (1.0 - dynamic_mask.unsqueeze(-1).to(opacity_maps.dtype))
+
             sh_maps = rearrange(sh_maps, "b n h w (i c) -> b n h w i c",i=3)
             sh_maps = sh_maps * self.sh_mask
 
@@ -1345,7 +1348,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 frame_idx = c // self.num_cams
                 cam_idx = c % self.num_cams
 
-                anno_key = f'vehicle_annotations_frame_{frame_idx * self.context_span if frame_idx > 0 else 0}'
+                anno_key = f'vehicle_annotations_frame_{frame_idx}'
                 lookup_idx = cam_idx
                 if anno_key not in inputs:
                     anno_key = 'vehicle_annotations'
@@ -1416,16 +1419,28 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             c2e_extr_list.append(c2e_extr)
         image_list = torch.stack(image_list, dim=1)
 
-        # Extract dynamic masks via SAM2 + vehicle bbox annotations
-        dynamic_mask = self._extract_dynamic_mask(inputs, image_list)
+        # Build all-frame image list [B, (context_span+1)*num_cams, C, H, W] for dynamic mask extraction
+        all_image_list = data_dict['all_dict'][('color_aug', 0)]  # all 7 frames × 6 cams
+
+        # Extract dynamic masks for all frames [B, 42, H, W]
+        dynamic_mask_all = self._extract_dynamic_mask(data_dict['all_dict'], all_image_list)
+
+        # Extract context-frame-only mask [B, 12, H, W] for model forward pass (frame 0 + frame 6)
+        if dynamic_mask_all is not None:
+            context_indices = (list(range(self.num_cams)) +
+                               list(range(self.context_span * self.num_cams,
+                                          (self.context_span + 1) * self.num_cams)))
+            dynamic_mask_context = dynamic_mask_all[:, context_indices, :, :]
+        else:
+            dynamic_mask_context = None
 
         # 6 -> 18
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
-        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list, dynamic_mask=dynamic_mask)
+        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list, dynamic_mask=dynamic_mask_context)
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
-        outputs['dynamic_mask'] = dynamic_mask  # [B, S, H, W] bool or None
+        outputs['dynamic_mask'] = dynamic_mask_all  # [B, 42, H, W] bool or None, full mask for all frames
 
         c2e_extr_list = torch.stack(c2e_extr_list, dim=1) # b, s, 4, 4
 
@@ -2122,9 +2137,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 outputs[('warped_mask', frame_id, cam_id)] = mask_warped.detach()
 
                 dyn = recontrast_data.get('dynamic_mask', None)
-                if dyn is not None and frame_id in self.all_context_frame_ids:
-                    input_idx = self.all_context_frame_ids.index(frame_id)
-                    dyn_idx = input_idx * self.num_cams + cam_id
+                if dyn is not None:
+                    dyn_idx = frame_id * self.num_cams + cam_id
                     dyn_slice = dyn[:, dyn_idx, :, :]  # [B, H, W]
                     dyn_slice = F.interpolate(dyn_slice.unsqueeze(1).float(),
                                               size=(self.render_height, self.render_width),
@@ -2495,12 +2509,36 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         novel_count =0
         ## Haibao: self.all_render_frame_ids?? [0, 1, 2, 3, 4, 5, 6]
         for frame_id in self.all_render_frame_ids:
-            for cam_id in range(self.num_cams): 
+            for cam_id in range(self.num_cams):
                 pred = batch_data[('gaussian_color', frame_id, cam_id)].detach()
-                gt = batch_data[('groudtruth', frame_id, cam_id)]    
-                psnr += self.compute_psnr(gt, pred).mean()
-                ssim += self.compute_ssim(gt, pred).mean()
-                lpips += self.compute_lpips(gt, pred).mean()
+                gt = batch_data[('groudtruth', frame_id, cam_id)]
+                dyn = batch_data.get(('dynamic_mask', frame_id, cam_id), None)
+
+                if dyn is not None:
+                    static_mask = 1.0 - dyn.float()  # [B, 1, H, W], 1=static
+                    # PSNR: weighted MSE over static pixels only
+                    sq_err = (pred.clamp(0, 1) - gt.clamp(0, 1)) ** 2
+                    mse = compute_masked_loss(sq_err, static_mask, eps=0)
+                    psnr += -10 * torch.log10(mse.clamp(min=1e-10))
+                    # SSIM: per-pixel map averaged over static pixels
+                    static_np = static_mask[0, 0].cpu().numpy()  # [H, W]
+                    ssim_vals = []
+                    for g, h in zip(gt, pred):
+                        _, ssim_map = structural_similarity(
+                            g.detach().cpu().numpy(), h.detach().cpu().numpy(),
+                            win_size=11, gaussian_weights=True,
+                            channel_axis=0, data_range=1.0, full=True,
+                        )
+                        ssim_hw = ssim_map.mean(0)  # [H, W]
+                        ssim_vals.append(float((ssim_hw * static_np).sum() / max(static_np.sum(), 1e-8)))
+                    ssim += torch.tensor(np.mean(ssim_vals), dtype=pred.dtype, device=pred.device)
+                    # LPIPS: spatial map masked (consistent with compute_gaussian_loss)
+                    lpips_map = self.lpips(pred, gt, normalize=True)  # [B, 1, H, W]
+                    lpips += compute_masked_loss(lpips_map, static_mask, eps=0)
+                else:
+                    psnr += self.compute_psnr(gt, pred).mean()
+                    ssim += self.compute_ssim(gt, pred).mean()
+                    lpips += self.compute_lpips(gt, pred).mean()
                 novel_count += 1
 
         psnr /= novel_count
