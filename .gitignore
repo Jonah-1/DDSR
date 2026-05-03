@@ -6,4 +6,5 @@ work_dirs
 segment-anything-2
 history
 samples
+*.npz
 
